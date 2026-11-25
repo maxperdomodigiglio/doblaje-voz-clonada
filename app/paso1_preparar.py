@@ -160,6 +160,23 @@ def _ventanas(runs, segmentos, dur, y=None):
     return fus
 
 
+IDIOMA_DETECTADO = None
+
+
+def _detectar_idioma(model, y):
+    """Idioma del habla: vota en 3 tramos de 30 s (a 1/4, 1/2 y 3/4), asi una cancion al principio no confunde."""
+    import whisper
+    n = 30 * 16000
+    total = {}
+    for frac in ((0.5,) if len(y) <= n else (0.25, 0.5, 0.75)):
+        i0 = max(0, min(len(y) - n, int(len(y) * frac) - n // 2))
+        mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(y[i0:i0 + n]), n_mels=model.dims.n_mels).to(model.device)
+        _, probs = model.detect_language(mel)
+        for k, v in probs.items():
+            total[k] = total.get(k, 0.0) + v
+    return max(total, key=total.get)
+
+
 def transcribir(voz_path, cfg):
     import librosa
     import torch
@@ -172,10 +189,23 @@ def transcribir(voz_path, cfg):
     y, _ = librosa.load(str(voz_path), sr=16000, mono=True)
     y = y.astype(np.float32)
     dur = len(y) / 16000
-    opts = dict(language=cfg.get("idioma_origen", "es"), task="transcribe", word_timestamps=True,
+    global IDIOMA_DETECTADO
+    idioma = cfg.get("idioma_origen", "es")
+    if not idioma or idioma == "auto":
+        try:
+            idioma = _detectar_idioma(model, y)
+        except Exception:
+            idioma = None  # que lo detecte Whisper al transcribir
+    opts = dict(language=idioma, task="transcribe", word_timestamps=True,
                 fp16=(dev == "cuda"))
     prompt = cfg.get("whisper_prompt") or None
     r = model.transcribe(y, condition_on_previous_text=False, initial_prompt=prompt, verbose=False, **opts)
+    if not idioma:
+        idioma = r.get("language") or "es"
+        opts["language"] = idioma
+    if idioma != cfg.get("idioma_origen"):
+        log(f"  Idioma del audio: {idioma}")
+    IDIOMA_DETECTADO = idioma
     segmentos = _segmentos_de(r, eco=prompt)
 
     # segunda pasada: volver a transcribir las zonas con voz que Whisper salteo
@@ -319,7 +349,7 @@ def rehacer_ventanas(d, cfg):
     segmentos = es["segmentos"]
     for a, b in vents:
         previo = " ".join(sg["text"] for sg in segmentos if sg["end"] <= a)[-200:] or None
-        rr = model.transcribe(y[int(a * 16000):int(b * 16000)], language=cfg.get("idioma_origen", "es"),
+        rr = model.transcribe(y[int(a * 16000):int(b * 16000)], language=es.get("idioma_origen") or "es",
                               task="transcribe", word_timestamps=True, fp16=(dev == "cuda"),
                               condition_on_previous_text=True, initial_prompt=previo, beam_size=5,
                               patience=1.0, verbose=None)
@@ -386,6 +416,7 @@ def preparar(video, cfg):
     log(f"  {len(segmentos)} segmentos, {len(bloques)} bloques; referencia de voz {ref['start']:.1f}-{ref['end']:.1f}s")
 
     escribir_json(d / "es.json", {"version": VERSION, "video": video.name, "slug": slug, "duracion": round(dur, 3),
+                                  "idioma_origen": IDIOMA_DETECTADO or "es",
                                   "segmentos": segmentos, "bloques": bloques, "ref": ref})
     cues = []
     for sg in segmentos:

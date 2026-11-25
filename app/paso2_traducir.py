@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-from comun import (APP_DIR, progreso, archivo_traduccion, carpeta_proceso, ejecutar_principal, escribir_json, escribir_srt,
+from comun import (APP_DIR, ORIGENES, idioma_origen, progreso, archivo_traduccion, carpeta_proceso, ejecutar_principal, escribir_json, escribir_srt,
                    leer_json, log, log_error, normalizar_palabras)
 from textos import bloques_por_oraciones, corregir_segmentos, cues_desde_palabras, palabras_limpias
 
@@ -25,8 +25,7 @@ FORZAR = "--forzar" in sys.argv
 SIMULAR = "--simular" in sys.argv  # pruebas sin GPU ni modelo: no corrige y "traduce" marcando el texto
 SOLO = [a for a in sys.argv[1:] if not a.startswith("--")]
 VERSION_CORR = 1
-CONTEXTO = ("Habla el Dr. Gregorio Dunayevich, psicologo y psicoanalista, a camara, en una serie de videos "
-            "sobre arte, rock, genios, drogas y suicidio.")
+CONTEXTO = "Una persona habla a camara o en un audio, en primera persona."
 
 
 # ---------------------------------------------------------------- modelo local
@@ -89,14 +88,15 @@ def aplicar_glosario_es(texto, glos):
 
 # ---------------------------------------------------------------- 1) correccion del castellano
 SIS_ES = (
-    "Sos corrector de transcripciones automaticas (Whisper) de videos en castellano. {contexto}\n"
+    "Sos corrector de transcripciones automaticas (Whisper) de audios en {idioma}. {contexto}\n"
     "Te paso lineas numeradas. Corregi SOLO:\n"
     "- puntuacion, mayusculas y signos de pregunta/exclamacion de apertura;\n"
     "- errores evidentes de transcripcion: nombres propios mal escritos (musicos, artistas, autores, bandas) y "
     "palabras que no tienen sentido por la parecida que si lo tiene.\n"
     "No resumas, no cambies el estilo ni el orden, no agregues ni saques ideas, no unas ni separes lineas. "
     "Si una linea esta bien, devolvela igual.\n"
-    "Respuesta: exactamente las mismas lineas, una por renglon, con el formato 'N: texto'. Nada mas."
+    "Respuesta en el mismo idioma de las lineas: exactamente las mismas lineas, una por renglon, con el formato "
+    "'N: texto'. Nada mas."
 )
 
 
@@ -109,9 +109,9 @@ def _valida(orig, nuevo):
     return difflib.SequenceMatcher(None, " ".join(a), " ".join(b)).ratio() >= 0.75
 
 
-def corregir_castellano(es, llm, glos, avance=None):
+def corregir_castellano(es, llm, glos, avance=None, src="es"):
     segs = es["segmentos"]
-    textos = [aplicar_glosario_es(sg["text"], glos) for sg in segs]
+    textos = [aplicar_glosario_es(sg["text"], glos) if src == "es" else sg["text"] for sg in segs]
     final = list(textos)
     cambios, rechazados = [], []
     nombres = ", ".join(glos.get("nombres", []))
@@ -126,7 +126,8 @@ def corregir_castellano(es, llm, glos, avance=None):
                    + "Lineas a corregir:\n<<<LINEAS>>>\n"
                    + "\n".join(f"{k + 1}: {t}" for k, t in enumerate(grupo)))
         try:
-            resp = llm.chat(SIS_ES.format(contexto=llm.cfg.get("contexto") or CONTEXTO), usuario, max_new_tokens=60 + 2 * sum(len(t) for t in grupo) // 3)
+            resp = llm.chat(SIS_ES.format(contexto=llm.cfg.get("contexto") or CONTEXTO,
+                                          idioma=ORIGENES.get(src, (src, src))[1]), usuario, max_new_tokens=60 + 2 * sum(len(t) for t in grupo) // 3)
         except Exception:
             log_error("correccion del castellano (sigo con la transcripcion original)")
             continue
@@ -153,18 +154,20 @@ def corregir_castellano(es, llm, glos, avance=None):
 
 
 # ---------------------------------------------------------------- 2) traduccion
-def sistema_traduccion(cfg):
+def sistema_traduccion(cfg, src="es"):
     lang = cfg["idioma_destino"]
+    origen = ORIGENES.get(src, (src,))[0]
     extra = {
         "ru": " In Russian, write people's and bands' names in Cyrillic as usual (e.g. Курт Кобейн), "
               "but keep song and album titles in their original language.",
         "de": " Use natural spoken German (du/Sie as fits a talk to the audience: address viewers with 'Sie').",
+        "es": " Use neutral Latin American Spanish.",
     }.get(cfg["idioma_codigo"], "")
     return (
-        f"You are an expert audiovisual translator preparing a voice-over dub from Spanish into natural, fluent "
-        f"spoken {lang}. About the video (in Spanish): {cfg.get('contexto') or CONTEXTO}\n"
+        f"You are an expert audiovisual translator preparing a voice-over dub from {origen} into natural, fluent "
+        f"spoken {lang}. About the video (written in Spanish): {cfg.get('contexto') or CONTEXTO}\n"
         f"Rules:\n"
-        f"- Translate the fragment completely and faithfully, in first person, the way he would say it in {lang}. "
+        f"- Translate the fragment completely and faithfully, in first person, the way the speaker would say it in {lang}. "
         f"No explanations, no notes, no quotation marks around the whole text.\n"
         f"- The fragment may start or end mid-sentence: keep it that way so it joins naturally with the next one.\n"
         f"- It is read aloud over the same time slot: keep it about as long as the original, prefer concise wording.\n"
@@ -177,16 +180,16 @@ def sistema_traduccion(cfg):
 _ES_FRECUENTES = {"que", "el", "los", "las", "por", "una", "pero", "porque", "como", "esto", "muy", "también", "tambien"}
 
 
-def _problema_traduccion(es_txt, tr, cod):
+def _problema_traduccion(es_txt, tr, cod, src="es"):
     if not tr:
         return "vacia"
     r = len(tr) / max(1, len(es_txt))
     if r < 0.4 or r > 2.0:
-        return f"largo raro ({r:.1f}x el castellano)"
+        return f"largo raro ({r:.1f}x el original)"
     pal = normalizar_palabras(tr)
     if cod == "ru" and not re.search(r"[А-Яа-яЁё]", tr):
         return "no parece ruso"
-    if cod != "ru" and pal and sum(p in _ES_FRECUENTES for p in pal) / len(pal) > 0.15:
+    if src == "es" and cod != "es" and pal and sum(p in _ES_FRECUENTES for p in pal) / len(pal) > 0.15:
         return "quedo castellano sin traducir"
     return None
 
@@ -201,9 +204,9 @@ def _limpiar(tr, cfg):
     return " ".join(tr.split())
 
 
-def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None):
+def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None, src="es"):
     """parcial: archivo donde se guarda cada bloque traducido, para retomar si se corta o se detiene."""
-    sis = sistema_traduccion(cfg)
+    sis = sistema_traduccion(cfg, src)
     L = cfg["idioma_destino"]
     hechos, avisos = [], []
     cache = {}
@@ -234,7 +237,7 @@ def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None):
             except Exception:
                 log_error(f"traduccion del bloque {i + 1}")
                 tr = ""
-            problema = _problema_traduccion(txt, tr, cfg["idioma_codigo"]) if not SIMULAR else None
+            problema = _problema_traduccion(txt, tr, cfg["idioma_codigo"], src) if not SIMULAR else None
             if not problema:
                 break
         if problema:
@@ -272,19 +275,19 @@ def texto_para_voz(txt, cod, glos):
             return s
 
     txt = re.sub(r"\d+(?:[.,]\d+)?", num, txt)
-    pct = {"en": " percent", "de": " Prozent", "ru": " процентов"}.get(cod, "%")
+    pct = {"en": " percent", "de": " Prozent", "ru": " процентов", "es": " por ciento"}.get(cod, "%")
     return txt.replace("%", pct)
 
 
 # ---------------------------------------------------------------- por capitulo
-def es_corregido(d, es, llm, glos, avance=None):
+def es_corregido(d, es, llm, glos, avance=None, src="es"):
     p = d / "es_corregido.json"
     if p.exists() and not FORZAR:
         prev = leer_json(p)
         if prev.get("version") == VERSION_CORR and p.stat().st_mtime >= (d / "es.json").stat().st_mtime:
             return prev
-    log(f"[{d.name}] Corrigiendo la transcripcion en castellano...")
-    segs, cambios, rechazados = corregir_castellano(es, llm, glos, avance)
+    log(f"[{d.name}] Corrigiendo la transcripcion ({ORIGENES.get(src, (src, src))[1]})...")
+    segs, cambios, rechazados = corregir_castellano(es, llm, glos, avance, src)
     data = {"version": VERSION_CORR, "segmentos": segs,
             "cambios": [{"t": round(t, 2), "antes": a, "despues": b} for t, a, b in cambios],
             "rechazados": [{"t": round(t, 2), "antes": a, "propuesta": b} for t, a, b in rechazados]}
@@ -295,6 +298,7 @@ def es_corregido(d, es, llm, glos, avance=None):
 
 def traducir_capitulo(d, cfg, llm, glos):
     es = leer_json(d / "es.json")
+    src = idioma_origen(es, cfg)
     destino = archivo_traduccion(d, cfg)
     if destino.exists():
         prev = leer_json(destino)
@@ -318,7 +322,7 @@ def traducir_capitulo(d, cfg, llm, glos):
 
     # si ya hay una version en ingles revisada, se usan sus mismos bloques y sirve de referencia
     en_rev = None
-    if cfg["idioma_codigo"] != "en" and (d / "en.json").exists():
+    if cfg["idioma_codigo"] not in ("en", "es") and src == "es" and (d / "en.json").exists():
         en_prev = leer_json(d / "en.json")
         if not en_prev.get("auto") or en_prev.get("curado"):
             en_rev = en_prev["bloques"]
@@ -328,18 +332,23 @@ def traducir_capitulo(d, cfg, llm, glos):
         log(f"[{d.name}] Traduciendo {len(bloques)} bloques al {cfg['idioma_nombre']} "
             f"(con la version en ingles revisada de referencia)...")
         trads, avisos = traducir_bloques(bloques, llm, cfg, ref_en=[b["en"] for b in en_rev],
-                                         avance=lambda i, n: av_trad(i, n, base=3), parcial=parcial)
+                                         avance=lambda i, n: av_trad(i, n, base=3), parcial=parcial, src=src)
     else:
-        corr = es_corregido(d, es, llm, glos, av_corr)
+        corr = es_corregido(d, es, llm, glos, av_corr, src)
         segs = corr["segmentos"]
         if not (d / "es.srt").exists():
             cues = cues_desde_palabras(segs)
             escribir_srt(d / "es.srt", [tuple(c) for c in cues])
-            log(f"  Subtitulos en castellano: {len(cues)}")
+            log(f"  Subtitulos del original: {len(cues)}")
         ws = palabras_limpias({"segmentos": segs})
         bloques = bloques_por_oraciones(ws, max_dur=float(cfg.get("bloque_max_seg", 14.0)) - 1.0)
-        log(f"[{d.name}] Traduciendo {len(bloques)} bloques al {cfg['idioma_nombre']}...")
-        trads, avisos = traducir_bloques(bloques, llm, cfg, avance=av_trad, parcial=parcial)
+        if src == cfg["idioma_codigo"]:
+            # mismo idioma: no hay que traducir, solo se cambia la voz
+            log(f"[{d.name}] El audio ya esta en {cfg['idioma_nombre']}: no traduzco, solo cambio la voz")
+            trads, avisos = [b[2] for b in bloques], []
+        else:
+            log(f"[{d.name}] Traduciendo {len(bloques)} bloques al {cfg['idioma_nombre']}...")
+            trads, avisos = traducir_bloques(bloques, llm, cfg, avance=av_trad, parcial=parcial, src=src)
 
     cod = cfg["idioma_codigo"]
     salida = []
@@ -349,7 +358,7 @@ def traducir_capitulo(d, cfg, llm, glos):
         if voz != tr:
             b["tts"] = voz
         salida.append(b)
-    escribir_json(destino, {"slug": d.name, "video": es["video"], "idioma": cod, "auto": True,
+    escribir_json(destino, {"slug": d.name, "video": es["video"], "idioma": cod, "origen": src, "auto": True,
                             "modelo": cfg.get("modelo_traduccion", "Qwen/Qwen3-4B-Instruct-2507"), "bloques": salida})
     escribir_revision(d, cfg, es, corr, avisos)
     parcial.unlink(missing_ok=True)

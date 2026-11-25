@@ -1,6 +1,6 @@
 {
   "carpeta_videos": "%USERPROFILE%\\Desktop",
-  "idioma_origen": "es",
+  "idioma_origen": "auto",
   "idioma_destino": "English",
   "demucs_modelo": "htdemucs_ft",
   "whisper_modelo": "large-v3",

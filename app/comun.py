@@ -12,17 +12,38 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 EXT_VIDEO = {".mp4", ".mov", ".mkv", ".m4v", ".webm"}
+EXT_AUDIO = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+EXT_MEDIOS = EXT_VIDEO | EXT_AUDIO
 # codigo -> (nombre para Qwen3-TTS, codigo ISO 639-2 del audio, sufijo de los archivos, nombre en castellano)
 IDIOMAS = {
     "en": ("English", "eng", "EN", "Inglés"),
     "de": ("German", "deu", "DE", "Alemán"),
     "ru": ("Russian", "rus", "RU", "Ruso"),
+    "es": ("Spanish", "spa", "ES", "Español"),
+}
+# idiomas que puede tener el audio original: codigo -> (nombre en ingles, en castellano, ISO 639-2)
+ORIGENES = {
+    "es": ("Spanish", "castellano", "spa"), "en": ("English", "inglés", "eng"), "de": ("German", "alemán", "deu"),
+    "ru": ("Russian", "ruso", "rus"), "fr": ("French", "francés", "fra"), "it": ("Italian", "italiano", "ita"),
+    "pt": ("Portuguese", "portugués", "por"),
 }
 
 
+def es_audio(path):
+    return Path(path).suffix.lower() in EXT_AUDIO
+
+
+def idioma_origen(es, cfg):
+    """Idioma del audio original: el que detecto el Paso 1, o el de la config (castellano si no hay dato)."""
+    cod = es.get("idioma_origen") or cfg.get("idioma_origen") or "es"
+    return "es" if cod == "auto" else cod
+
+
 def archivo_traduccion(d, cfg):
-    """en.json para ingles (como siempre), de.json / ru.json para los otros idiomas."""
-    return Path(d) / f"{cfg.get('idioma_codigo', 'en')}.json"
+    """en.json para ingles (como siempre), de.json / ru.json para los otros idiomas.
+    El castellano va en es_doblaje.json porque es.json es la transcripcion del Paso 1."""
+    cod = cfg.get("idioma_codigo", "en")
+    return Path(d) / ("es_doblaje.json" if cod == "es" else f"{cod}.json")
 
 
 def carpeta_idioma(d, cfg):
@@ -81,7 +102,7 @@ def carpeta_salida(cfg):
 
 def listar_videos(cfg):
     base = carpeta_videos(cfg)
-    return sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in EXT_VIDEO)
+    return sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in EXT_MEDIOS)
 
 
 def slug_de(nombre):

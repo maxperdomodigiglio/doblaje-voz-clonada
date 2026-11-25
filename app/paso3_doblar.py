@@ -5,7 +5,8 @@ Para cada capitulo con traduccion (_proceso/<capNN>/en.json):
   2. controla cada bloque con Whisper (si no dice lo que tiene que decir, lo regenera)
   3. lo ubica en su lugar del video (acelera hasta max_aceleracion si no entra)
   4. mezcla con el fondo original (musica/ambiente) bajandolo un poco debajo de la voz
-  5. normaliza el volumen (LUFS) y arma el video final con subtitulos en espanol
+  5. normaliza el volumen (LUFS) y arma el video final con subtitulos (castellano o el idioma original)
+Si la entrada es un audio (mp3, wav, m4a...), sale un audio doblado (mp3) y los subtitulos en .srt.
 Resultado en <carpeta>/salida/
 """
 import hashlib
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from comun import (progreso, archivo_traduccion, carpeta_idioma, referencia_voz, APP_DIR, carpeta_proceso, carpeta_salida, correr, ejecutar_principal, escribir_json,
+from comun import (ORIGENES, es_audio, idioma_origen, progreso, archivo_traduccion, carpeta_idioma, referencia_voz, APP_DIR, carpeta_proceso, carpeta_salida, correr, ejecutar_principal, escribir_json,
                    escribir_srt, ffmpeg, ffmpeg_exe, leer_json, log, log_error, texto_a_cues, wer)
 
 SR = 44100
@@ -24,6 +25,39 @@ FORZAR = "--forzar" in sys.argv
 SIMULAR = "--simular" in sys.argv  # pruebas sin GPU: reemplaza la voz por un tono
 SOLO = [a for a in sys.argv[1:] if not a.startswith("--")]
 SUFIJO, ISO3 = "EN", "eng"  # se pisan con la config (sufijo_salida / idioma_iso3)
+
+
+def idioma_subs(src, cod):
+    """Subtitulos del resultado: en castellano siempre que se pueda (el original si es castellano, la traduccion si
+    se dobla al castellano); si no, en el idioma original. Devuelve (usar_traduccion, codigo)."""
+    if src != "es" and cod == "es":
+        return True, "es"
+    return False, src
+
+
+def _iso3(cod):
+    return ORIGENES.get(cod, (cod, cod, cod))[2]
+
+
+def _nombre_idioma(cod):
+    return ORIGENES.get(cod, (cod,))[0]
+
+
+def exportar_audio(mezcla, destino_mp3, titulo=""):
+    """Audio final: mp3 192k (o m4a si este ffmpeg no trae mp3). Devuelve la ruta que quedo."""
+    meta = ["-metadata", f"title={titulo}"] if titulo else []
+    for dest, codec in ((destino_mp3, ["-c:a", "libmp3lame", "-b:a", "192k"]),
+                        (destino_mp3.with_suffix(".m4a"), ["-c:a", "aac", "-b:a", "192k"])):
+        tmp = dest.with_name(dest.stem + ".tmp" + dest.suffix)
+        try:
+            ffmpeg("-i", mezcla, "-map", "0:a:0", *codec, *meta, "-metadata:s:a:0", f"language={ISO3}", tmp)
+            tmp.replace(dest)
+            return dest
+        except RuntimeError:
+            tmp.unlink(missing_ok=True)
+            if dest is not destino_mp3:
+                raise
+    return destino_mp3
 
 
 def set_seed(seed):
@@ -639,7 +673,7 @@ def leer_srt(path):
     return cues
 
 
-def video_ajustado(video, segs, mezcla, srt, destino, fps):
+def video_ajustado(video, segs, mezcla, srt, destino, fps, sub_cod="es"):
     partes, etiquetas = [f"[0:v]split={len(segs)}" + "".join(f"[s{k}]" for k in range(len(segs)))], []
     for k, sg in enumerate(segs):
         partes.append(f"[s{k}]trim=start={sg['a']:.4f}:end={sg['b']:.4f},setpts=(PTS-STARTPTS)/{sg['f']:.6f}[v{k}]")
@@ -652,8 +686,8 @@ def video_ajustado(video, segs, mezcla, srt, destino, fps):
             correr([ffmpeg_video_exe(), "-hide_banner", "-nostdin", "-y", "-i", video, "-i", mezcla, "-i", srt,
                     "-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", "-map", "2:0", *codec,
                     "-c:a", "aac", "-b:a", "192k", "-c:s", "mov_text",
-                    "-metadata:s:a:0", f"language={ISO3}", "-metadata:s:s:0", "language=spa",
-                    "-metadata:s:s:0", "title=Espanol", "-disposition:s:0", "default",
+                    "-metadata:s:a:0", f"language={ISO3}", "-metadata:s:s:0", f"language={_iso3(sub_cod)}",
+                    "-metadata:s:s:0", f"title={_nombre_idioma(sub_cod)}", "-disposition:s:0", "default",
                     "-movflags", "+faststart", tmp])
             tmp.replace(destino)
             return
@@ -662,19 +696,27 @@ def video_ajustado(video, segs, mezcla, srt, destino, fps):
     raise ultimo
 
 
-def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem):
+def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem,
+                           audio=False, src="es"):
+    """Modo 'ajustar video': la voz doblada va a velocidad natural y el video (o el fondo, si es un audio) se
+    acelera o frena por tramos para acompanarla."""
     import soundfile as sf
     voz_orig, _ = sf.read(str(d / "voz.flac"), dtype="float32")
     if voz_orig.ndim > 1:
         voz_orig = voz_orig.mean(1)
     fondo, _ = sf.read(str(d / "fondo.flac"), dtype="float32", always_2d=True)
     dur_total = es["duracion"]
-    fps = fps_video(video)
+    if audio:
+        # sin imagen: la linea de tiempo se adapta libremente a la voz nueva (el fondo se estira o encoge)
+        fps = 100.0
+        cfg = dict(cfg, video_vel_max=cfg.get("audio_vel_max", 3.0), video_vel_min=cfg.get("audio_vel_min", 0.5))
+    else:
+        fps = fps_video(video)
     segs = plan_ajuste(bloques, [len(c) / SR for c in clips], dur_total, fondo.mean(1), fps, cfg)
     total = segs[-1]["T"] + segs[-1]["n"]
     N = int(round(total * SR))
     progreso(d.name, 3, 82, "mezclando la voz con la música")
-    log(f"  Video ajustado al {cfg.get('idioma_nombre', 'ingles')}: {dur_total:.0f}s -> {total:.0f}s "
+    log(f"  {'Audio' if audio else 'Video'} ajustado al {cfg.get('idioma_nombre', 'ingles')}: {dur_total:.0f}s -> {total:.0f}s "
         f"(velocidad media {dur_total / total:.2f}x, max {max(sg['f'] for sg in segs):.2f}x)")
 
     # voz en ingles, a velocidad natural, una frase detras de otra
@@ -744,22 +786,30 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
     srt_en = w / "traduccion.srt"
     escribir_srt(srt_en, cues_en)
 
-    log("  Armando video final (re-codificando la imagen)...")
-    progreso(d.name, 3, 88, "armando el video")
-    video_ajustado(video, segs, w / "mezcla.wav", srt_es_aj, out_mp4, fps)
-    (sal / f"{stem} [ES].srt").write_bytes(srt_es_aj.read_bytes())
-    (sal / f"{stem} [{SUFIJO}].srt").write_bytes(srt_en.read_bytes())
-    if cfg.get("quemar_subtitulos"):
-        try:
-            progreso(d.name, 3, 95, "grabando los subtítulos en la imagen")
-            arriba = [(mapear(a, segs), mapear(z, segs)) for a, z in detectar_zocalos(video, d)]
-            quemar_subtitulos(out_mp4, w / "mezcla.wav", srt_es_aj, quemado, w, arriba=arriba)
-        except Exception:
-            log_error("grabar subtitulos (el video con subtitulos seleccionables igual quedo bien)")
+    usar_trad, sub_cod = idioma_subs(src, cfg.get("idioma_codigo", "en"))
+    srt_sub = srt_en if usar_trad else srt_es_aj
+    (sal / f"{stem} [{src.upper()}].srt").write_bytes(srt_es_aj.read_bytes())  # lo que se dice en el original
+    (sal / f"{stem} [{SUFIJO}].srt").write_bytes(srt_en.read_bytes())          # lo que dice el doblaje
+    if audio:
+        log("  Armando el audio final...")
+        progreso(d.name, 3, 90, "armando el audio")
+        out_mp4 = exportar_audio(w / "mezcla.wav", out_mp4, titulo=f"{stem} [{SUFIJO}]")
+    else:
+        log("  Armando video final (re-codificando la imagen)...")
+        progreso(d.name, 3, 88, "armando el video")
+        video_ajustado(video, segs, w / "mezcla.wav", srt_sub, out_mp4, fps, sub_cod)
+        if cfg.get("quemar_subtitulos"):
+            try:
+                progreso(d.name, 3, 95, "grabando los subtítulos en la imagen")
+                arriba = [(mapear(a, segs), mapear(z, segs)) for a, z in detectar_zocalos(video, d)]
+                quemar_subtitulos(out_mp4, w / "mezcla.wav", srt_sub, quemado, w, arriba=arriba)
+            except Exception:
+                log_error("grabar subtitulos (el video con subtitulos seleccionables igual quedo bien)")
 
     flojos = [x for x in informe if (x.get("wer") or 0) > float(cfg.get("wer_max", 0.2)) or x.get("fuga")]
     desfasados = [c for c in colocados if c["desfase"] > 0.3]
-    escribir_json(w / "informe.json", {"modo": "ajustar_video", "lufs_entrada": lufs_in, "duracion_original": dur_total,
+    escribir_json(w / "informe.json", {"modo": "ajustar_audio" if audio else "ajustar_video", "lufs_entrada": lufs_in,
+                                       "salida": out_mp4.name, "duracion_original": dur_total,
                                        "duracion_nueva": total, "tramos": segs, "bloques": informe,
                                        "colocados": colocados, "revisar_wer": [x["id"] for x in flojos],
                                        "acelerados": [(c["id"], c["factor"]) for c in colocados if c["factor"] > 1],
@@ -785,22 +835,31 @@ def doblar(d, cfg, motor):
     w = carpeta_idioma(d, cfg)
     ref_wav, ref_txt = referencia_voz(d, cfg)
     video = Path(cfg["carpeta_videos"]) / es["video"]
+    audio = es_audio(video)
+    src = idioma_origen(es, cfg)
+    cod = cfg.get("idioma_codigo", "en")
     stem = video.stem
     sal = carpeta_salida(cfg)
-    out_mp4 = sal / f"{stem} [{SUFIJO}].mp4"
     srt_es = d / "es.srt" if (d / "es.srt").exists() else d / "es_auto.srt"
-    quemado = sal / f"{stem} [{SUFIJO}] subs ES.mp4"
+    usar_trad, sub_cod = idioma_subs(src, cod)
+    if audio:
+        out_mp4 = sal / f"{stem} [{SUFIJO}].mp3"
+        if not out_mp4.exists() and out_mp4.with_suffix(".m4a").exists():
+            out_mp4 = out_mp4.with_suffix(".m4a")
+    else:
+        out_mp4 = sal / f"{stem} [{SUFIJO}].mp4"
+    quemado = sal / f"{stem} [{SUFIJO}] subs {sub_cod.upper()}.mp4"
     fuentes = [trad, srt_es, ref_wav]
     ref_hash = hashlib.md5(ref_wav.read_bytes() + ref_txt.encode()).hexdigest()[:10]
     previo = leer_json(w / "informe.json") if (w / "informe.json").exists() else {}
     # si se cambio la voz (muestra subida <-> voz del video) hay que volver a doblar aunque nada sea mas nuevo
     misma_voz = previo.get("ref_hash") == ref_hash or (previo.get("ref_hash") is None and not cfg.get("voz_muestra"))
     if out_mp4.exists() and not FORZAR and misma_voz and all(out_mp4.stat().st_mtime > f.stat().st_mtime for f in fuentes):
-        if cfg.get("quemar_subtitulos") and not cfg.get("ajustar_video") and (w / "mezcla.wav").exists() and (
+        if cfg.get("quemar_subtitulos") and not cfg.get("ajustar_video") and not audio and (w / "mezcla.wav").exists() and (
                 not quemado.exists() or quemado.stat().st_mtime < out_mp4.stat().st_mtime):
             log(f"[{d.name}] doblaje al dia; falta la version con subtitulos grabados")
             try:
-                quemar_subtitulos(video, w / "mezcla.wav", srt_es, quemado, w)
+                quemar_subtitulos(video, w / "mezcla.wav", w / "traduccion.srt" if usar_trad else srt_es, quemado, w)
                 log(f"[{d.name}] LISTO -> {quemado.name}")
             except Exception:
                 log_error("grabar subtitulos")
@@ -808,15 +867,16 @@ def doblar(d, cfg, motor):
             log(f"[{d.name}] ya doblado y sin cambios, salteo")
         progreso(d.name, 3, 100, "ya estaba doblado")
         return
-    log(f"[{d.name}] DOBLANDO: {video.name}")
+    log(f"[{d.name}] DOBLANDO: {video.name}" + (f" (audio en {ORIGENES.get(src, (src, src))[1]})" if src != "es" else ""))
     bloques = en["bloques"]
 
     progreso(d.name, 3, 1, "cargando la voz")
     clips, informe = generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt,
                                      avance=lambda i, n: progreso(d.name, 3, 2 + 78 * i / max(n, 1),
                                                                   f"generando la voz: frase {i + 1} de {n}"))
-    if cfg.get("ajustar_video"):
-        doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem)
+    if cfg.get("ajustar_video") or audio:
+        doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem,
+                               audio=audio, src=src)
         _anotar_voz(w, ref_hash)
         progreso(d.name, 3, 100, "listo")
         return
@@ -875,20 +935,21 @@ def doblar(d, cfg, motor):
     escribir_srt(srt_en, cues_en)
 
     log("  Armando video final...")
+    srt_sub = srt_en if usar_trad else srt_es
     tmp = out_mp4.with_suffix(".tmp.mp4")
-    ffmpeg("-i", video, "-i", w / "mezcla.wav", "-i", srt_es,
+    ffmpeg("-i", video, "-i", w / "mezcla.wav", "-i", srt_sub,
            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-c:s", "mov_text",
-           "-metadata:s:a:0", f"language={ISO3}", "-metadata:s:s:0", "language=spa",
-           "-metadata:s:s:0", "title=Espanol", "-disposition:s:0", "default",
+           "-metadata:s:a:0", f"language={ISO3}", "-metadata:s:s:0", f"language={_iso3(sub_cod)}",
+           "-metadata:s:s:0", f"title={_nombre_idioma(sub_cod)}", "-disposition:s:0", "default",
            "-movflags", "+faststart", tmp)
     tmp.replace(out_mp4)
-    (sal / f"{stem} [ES].srt").write_bytes(srt_es.read_bytes())
+    (sal / f"{stem} [{src.upper()}].srt").write_bytes(srt_es.read_bytes())
     (sal / f"{stem} [{SUFIJO}].srt").write_bytes(srt_en.read_bytes())
 
     if cfg.get("quemar_subtitulos"):
         try:
-            quemar_subtitulos(video, w / "mezcla.wav", srt_es, quemado, w)
+            quemar_subtitulos(video, w / "mezcla.wav", srt_sub, quemado, w)
         except Exception:
             log_error("grabar subtitulos (el video con subtitulos seleccionables igual quedo bien)")
 
