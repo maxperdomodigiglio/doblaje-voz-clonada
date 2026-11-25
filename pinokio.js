@@ -16,7 +16,7 @@ const instalado = () => {
 module.exports = {
   version: "3.7",
   title: "Doblaje Gregorio",
-  description: "Traduce y dobla videos (ingles, aleman o ruso) con voz clonada y subtitulos en espanol, todo local: Demucs + Whisper + Qwen",
+  description: "Traduce y dobla videos o audios (ingles, aleman, ruso o espanol) con voz clonada y subtitulos, todo local: Demucs + Whisper + Qwen",
   icon: "icon.png",
   menu: async (kernel, info) => {
     const r = {
