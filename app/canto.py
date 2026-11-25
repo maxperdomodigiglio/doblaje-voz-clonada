@@ -207,6 +207,87 @@ def silabas(texto, cod):
     return total
 
 
+# ---------------------------------------------------------------- afinacion y sonido del canto (Paso 3)
+def _ajustar_largo(x, n):
+    return np.pad(x, (0, max(0, n - len(x))))[:n]
+
+
+def f0_de(y, sr, periodo=5.0):
+    """Altura (Hz) cada 5 ms con WORLD (0 donde no hay voz)."""
+    import pyworld as pw
+    x = np.ascontiguousarray(y, dtype=np.float64)
+    f0, t = pw.dio(x, sr, f0_floor=60.0, f0_ceil=1100.0, frame_period=periodo)
+    return pw.stonemask(x, f0, t, sr), t
+
+
+def desafinacion(gen, orig, sr):
+    """Cuanto se aparta el canto generado de la melodia original: (cents medianos, octavas de diferencia)."""
+    import librosa
+    n = len(gen)
+    g16 = librosa.resample(gen, orig_sr=sr, target_sr=16000)
+    o16 = librosa.resample(_ajustar_largo(orig, n), orig_sr=sr, target_sr=16000)
+    fg, _ = f0_de(g16, 16000)
+    fo, _ = f0_de(o16, 16000)
+    m = min(len(fg), len(fo))
+    fg, fo = fg[:m], fo[:m]
+    ambos = (fg > 0) & (fo > 0)
+    if ambos.sum() < 20:
+        return None, 0
+    dif = 1200 * np.log2(fg[ambos] / fo[ambos])
+    octv = int(np.round(np.median(dif) / 1200))
+    return float(np.median(np.abs(dif - 1200 * octv))), octv
+
+
+def afinar(gen, orig, sr, fuerza=1.0):
+    """Autotune guiado: lleva la altura del canto generado a la de la voz original (la misma melodia, con su
+    vibrato), en la octava en que canta la voz nueva. Conserva el timbre y las vocales (WORLD).
+    Devuelve (audio, cents_antes, cents_despues)."""
+    import pyworld as pw
+    n = len(gen)
+    x = np.ascontiguousarray(gen, dtype=np.float64)
+    f0g, t = pw.dio(x, sr, f0_floor=60.0, f0_ceil=1100.0, frame_period=5.0)
+    f0g = pw.stonemask(x, f0g, t, sr)
+    fo, _ = f0_de(_ajustar_largo(orig, n), sr)
+    m = min(len(f0g), len(fo))
+    fo = np.pad(fo[:m], (0, len(f0g) - m))
+    ambos = (f0g > 0) & (fo > 0)
+    if ambos.sum() < 20:
+        return gen, None, None
+    dif = 1200 * np.log2(f0g[ambos] / fo[ambos])
+    octv = np.round(np.median(dif) / 1200)
+    meta = fo * (2.0 ** octv)
+    antes = float(np.median(np.abs(dif - 1200 * octv)))
+    nuevo = f0g.copy()
+    lg, lm = np.log2(f0g[ambos]), np.log2(meta[ambos])
+    nuevo[ambos] = 2.0 ** (lg + fuerza * (lm - lg))
+    sp = pw.cheaptrick(x, f0g, t, sr)
+    ap = pw.d4c(x, f0g, t, sr)
+    y = pw.synthesize(nuevo, sp, ap, sr, frame_period=5.0).astype(np.float32)
+    despues = float(np.median(np.abs(1200 * np.log2(nuevo[ambos] / meta[ambos]))))
+    return _ajustar_largo(y, n), antes, despues
+
+
+def sonido_voz(y, sr, cfg):
+    """Cadena de voz cantada: limpia graves, da presencia (se entiende mejor la letra), comprime suave y le pone
+    un poco de sala para que no suene 'pegada' sobre la musica."""
+    import tempfile
+
+    import soundfile as sf
+
+    from comun import ffmpeg
+    eco = float(cfg.get("canto_sala", 0.12))
+    cadena = ["highpass=f=90", "equalizer=f=250:t=q:w=1.0:g=-2", "equalizer=f=3200:t=q:w=1.2:g=3",
+              "acompressor=threshold=0.125:ratio=3:attack=8:release=120:makeup=1.4"]
+    if eco > 0:
+        cadena.append(f"aecho=1.0:1.0:45|85|130:{eco:.2f}|{eco * 0.7:.2f}|{eco * 0.45:.2f}")
+    with tempfile.TemporaryDirectory() as td:
+        a, b = Path(td) / "a.wav", Path(td) / "b.wav"
+        sf.write(str(a), y, sr, subtype="FLOAT")
+        ffmpeg("-i", a, "-filter:a", ",".join(cadena), "-c:a", "pcm_f32le", b)
+        z, _ = sf.read(str(b), dtype="float32")
+    return _ajustar_largo(z, len(y))
+
+
 # ---------------------------------------------------------------- canto (Paso 3)
 def huella(*partes):
     return hashlib.md5(json.dumps(partes, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]

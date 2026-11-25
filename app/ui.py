@@ -347,7 +347,8 @@ def _registro(salida):
     return "\n".join(l.lstrip("~") for l in salida)
 
 
-def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=ORIGEN_AUTO, cantar=False):
+def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=ORIGEN_AUTO, cantar=False,
+             afinar=True):
     carpeta = (carpeta or "").strip().strip('"')
     if not carpeta or not Path(carpeta).is_dir():
         raise gr.Error("Elegí primero la carpeta donde están los videos o audios.")
@@ -361,11 +362,13 @@ def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=
         raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine, o tocá Detener.")
     salida = deque(maxlen=500)
     try:
-        guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, origen=origen, cantar=bool(cantar))
+        guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, origen=origen, cantar=bool(cantar),
+                        afinar=bool(afinar))
         proc = Path(carpeta) / "_proceso"
         proc.mkdir(parents=True, exist_ok=True)
         ajustes = {"carpeta_videos": carpeta, "idioma_codigo": cod,
-                   "idioma_origen": ORIGENES_UI.get(origen, "auto"), "cantar": bool(cantar and motor_instalado())}
+                   "idioma_origen": ORIGENES_UI.get(origen, "auto"), "cantar": bool(cantar and motor_instalado()),
+                   "canto_afinar": bool(afinar)}
         if (contexto or "").strip():
             ajustes["contexto"] = contexto.strip()
         if voz == VOZ_MUESTRA and 3 in lista:
@@ -506,6 +509,8 @@ def armar():
                                           value=aj.get("contexto", ""), lines=2,
                                           placeholder="Ej.: Habla un psicólogo, en primera persona, sobre arte y "
                                                       "salud mental. Se guarda para esta carpeta.")
+                    afinar = gr.Checkbox(label="🎚️ Afinar el canto (autotune hacia la melodía original)",
+                                         value=bool(aj.get("afinar", True)), interactive=hay_canto)
                     forzar = gr.Checkbox(label="Rehacer las traducciones automáticas (las revisadas no se tocan)",
                                          value=False)
                 b_todo = gr.Button("▶  Hacer todo", elem_id="btn-todo")
@@ -553,11 +558,12 @@ def armar():
         b_ref.click(panel, [carpeta, idioma], tablero)
 
         def hacer(pasos):
-            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_):
-                yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_)
+            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_, afinar_):
+                yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_,
+                                    afinar_)
             return correr_pasos
 
-        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen, cantar]
+        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen, cantar, afinar]
         for boton, pasos in ((b_todo, (1, 2, 3)), (b1, (1,)), (b2, (2,)), (b3, (3,))):
             boton.click(hacer(pasos), entradas, [tablero, registro, b_pausa])
         b_pausa.click(pausar_continuar, None, b_pausa, concurrency_limit=None, queue=False)

@@ -557,7 +557,7 @@ def ensamblar(bloques, clips, voz_orig, dur_total, cfg):
 
 # ---------------------------------------------------------------- modo "ajustar video": el audio manda, el video se acelera
 # ---------------------------------------------------------------- partes cantadas
-VERSION_CANTO = 1
+VERSION_CANTO = 2  # 2: varias versiones por trozo, se elige la mejor, afinacion y sonido de voz
 
 
 def cargar_cantos(d, cfg):
@@ -589,12 +589,13 @@ def _ref_canto(voz, tr, wc, i):
     return ref, mejor["orig"]
 
 
-def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
-    """Canta cada trozo traducido con YingMusic-Singer (en su entorno) y arma la voz de cada tramo cantado.
+def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
+    """Canta cada trozo traducido con YingMusic-Singer (en su entorno), elige la mejor de varias versiones
+    (la que mejor se entiende y mas afinada), la afina a la melodia original y le da sonido de voz cantada.
     Devuelve [{"t0", "t1", "voz", "accion"}]; lo que no se pudo cantar queda con la voz original."""
     import soundfile as sf
 
-    from canto import correr_motor, huella, motor_instalado, REPO
+    from canto import REPO, afinar, correr_motor, desafinacion, huella, motor_instalado, sonido_voz
 
     voz, sr_v = sf.read(str(d / "voz.flac"), dtype="float32")
     if voz.ndim > 1:
@@ -605,9 +606,16 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
     indice = leer_json(idx_p) if idx_p.exists() else {}
     cod = cfg.get("idioma_codigo", "en")
     nfe = int(cfg.get("canto_pasos", 32))
+    n_cand = max(1, int(cfg.get("canto_versiones", 3)))
+    afina = bool(cfg.get("canto_afinar", True))
+    proc_h = (afina, float(cfg.get("canto_sala", 0.12)), float(cfg.get("canto_afinar_umbral", 15)))
     hay_motor = SIMULAR or motor_instalado()
     if not hay_motor and any(t["accion"] == "cantar" for t in tramos):
         log("  El canto no esta instalado (Pinokio: 'Instalar canto'): las canciones quedan con la voz original")
+
+    def candidatos_de(out):
+        return sorted(wc.glob(f"{out.stem}_c*.wav"))
+
     items, salidas = [], []
     for i, tr in enumerate(tramos):
         if tr["accion"] != "cantar" or not hay_motor:
@@ -625,20 +633,26 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
             mel = wc / f"melodia_{i}_{tz['k']}.wav"
             sf.write(str(mel), voz[int(tz["t0"] * SR):int(tz["t1"] * SR)], SR)
             out = wc / f"canto_{i}_{tz['k']}.wav"
-            h = huella(VERSION_CANTO, texto, cod, rtxt, rh, tz["t0"], tz["t1"], nfe)
-            salidas.append((i, tz, out, h))
-            if out.exists() and indice.get(out.name) == h and not FORZAR:
-                continue
-            items.append({"id": out.name, "melodia": str(mel), "ref": str(ref), "ref_texto": rtxt, "ref_idioma": rcod,
-                          "texto": texto, "idioma": cod, "salida": str(out), "semilla": 1000 + 97 * i + tz["k"],
-                          "_h": h})
+            hg = huella(VERSION_CANTO, texto, cod, rtxt, rh, tz["t0"], tz["t1"], nfe, n_cand)
+            hf = huella(hg, proc_h)
+            salidas.append((i, tz, out, hf, hg, texto, mel))
+            if FORZAR or indice.get("gen:" + out.name) != hg or not candidatos_de(out):
+                items.append({"id": out.name, "melodia": str(mel), "ref": str(ref), "ref_texto": rtxt,
+                              "ref_idioma": rcod, "texto": texto, "idioma": cod, "salida": str(out),
+                              "semilla": 1000 + 97 * i + tz["k"], "_h": hg})
     if items:
-        log(f"  Cantando {len(items)} trozo(s) en {cfg.get('idioma_nombre', cod)}...")
+        log(f"  Cantando {len(items)} trozo(s) en {cfg.get('idioma_nombre', cod)}"
+            + (f", {n_cand} versiones de cada uno" if n_cand > 1 else "") + "...")
+        for it in items:  # las versiones viejas no sirven
+            for c in candidatos_de(Path(it["salida"])):
+                c.unlink(missing_ok=True)
         if SIMULAR:
             res = {}
             for it in items:
                 y, _ = sf.read(it["melodia"], dtype="float32")
-                sf.write(it["salida"], np.stack([y, y], 1) * 0.9, SR)
+                for j in range(n_cand):
+                    sf.write(str(Path(it["salida"]).with_name(f"{Path(it['salida']).stem}_c{j}.wav")),
+                             np.stack([y, y], 1) * (0.9 - 0.1 * j), SR)
                 res[it["id"]] = {"ok": True}
         else:
             try:
@@ -650,6 +664,7 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
             trabajo = wc / "trabajo.json"
             escribir_json(trabajo, {"repo": str(REPO), "modelo": cfg.get("canto_modelo", "ASLP-lab/YingMusic-Singer-Plus"),
                                     "nfe": nfe, "cfg": float(cfg.get("canto_cfg", 3.0)), "cap": cap, "pct": [2, 30],
+                                    "candidatos": n_cand,
                                     "items": [{k: v for k, v in it.items() if k != "_h"} for it in items]})
             try:
                 res = correr_motor(trabajo)
@@ -658,19 +673,72 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
                 res = {}
         for it in items:
             if res.get(it["id"], {}).get("ok"):
-                indice[it["id"]] = it["_h"]
+                indice["gen:" + it["id"]] = it["_h"]
             else:
-                indice.pop(it["id"], None)
+                indice.pop("gen:" + it["id"], None)
                 log(f"  No se pudo cantar {it['id']}: {res.get(it['id'], {}).get('error', 'sin resultado')}")
         escribir_json(idx_p, indice)
+
+    # elegir la mejor version de cada trozo, afinarla y darle sonido de voz cantada
+    aviso_afinar = False
+    recien = {it["id"] for it in items}
+    for (i, tz, out, hf, hg, texto, mel) in salidas:
+        if out.exists() and indice.get(out.name) == hf and out.name not in recien:
+            continue  # ya elegido y procesado con estos mismos ajustes
+        cands = candidatos_de(out)
+        if indice.get("gen:" + out.name) != hg or not cands:
+            continue
+        n = int(round((tz["t1"] - tz["t0"]) * SR))
+        orig = voz[int(tz["t0"] * SR):int(tz["t0"] * SR) + n]
+        mejor = None
+        for j, c in enumerate(cands):
+            y, sr_y = sf.read(str(c), dtype="float32")
+            if y.ndim > 1:
+                y = y.mean(1)
+            if sr_y != SR:
+                import librosa
+                y = librosa.resample(y, orig_sr=sr_y, target_sr=SR)
+            y = np.pad(y, (0, max(0, n - len(y))))[:n]
+            oido = motor.escuchar(y, SR) if motor is not None else None
+            w_ = wer(texto, oido) if oido is not None else 0.0
+            try:
+                cents, _ = desafinacion(y, orig, SR)
+            except Exception:
+                cents = None
+            puntaje = w_ + 0.5 * min(1.0, (cents if cents is not None else 100.0) / 200.0)
+            if mejor is None or puntaje < mejor[0]:
+                mejor = (puntaje, j, y, w_, cents, oido)
+        _, j, y, w_, cents, oido = mejor
+        nota = f"versión {j + 1}/{len(cands)}, se entiende {100 * max(0.0, 1 - w_):.0f}%"
+        if afina and cents is not None and cents > float(cfg.get("canto_afinar_umbral", 15)):
+            try:
+                y, antes, despues = afinar(y, orig, SR, float(cfg.get("canto_afinar_fuerza", 1.0)))
+                if antes is not None:
+                    nota += f", afinado {antes:.0f} -> {despues:.0f} cents"
+            except ImportError:
+                if not aviso_afinar:
+                    log("  Falta pyworld para afinar (se instala solo al reiniciar la app)")
+                    aviso_afinar = True
+            except Exception:
+                log_error("afinar el canto")
+        elif cents is not None:
+            nota += f", afinación {cents:.0f} cents"
+        try:
+            y = sonido_voz(y, SR, cfg)
+        except Exception:
+            log_error("procesar la voz cantada")
+        sf.write(str(out), y, SR, subtype="FLOAT")
+        indice[out.name] = hf
+        log(f"  Trozo {out.stem}: {nota}" + (f" | oído: {oido[:80]}" if oido and w_ > 0.3 else ""))
+    escribir_json(idx_p, indice)
 
     resultado = []
     for i, tr in enumerate(tramos):
         a = int(round(tr["t0"] * SR))
         base = voz[a:a + int(round((tr["t1"] - tr["t0"]) * SR))].copy()
         cantados = 0
-        for (j, tz, out, h) in salidas:
-            if j != i or not out.exists() or indice.get(out.name) != h:
+        for (j, tz, out, hf, hg, texto, mel) in salidas:
+            if j != i or not out.exists() or indice.get(out.name) != hf:
                 continue
             y, sr_y = sf.read(str(out), dtype="float32")
             if y.ndim > 1:
@@ -990,12 +1058,19 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
         f"{[x['id'] for x in flojos] or 'ninguno'} | desfasados: {len(desfasados)}")
 
 
-def _anotar_voz(w, ref_hash):
+def _anotar_voz(w, ref_hash, canto_cfg=None):
     p = w / "informe.json"
     if p.exists():
         inf = leer_json(p)
         inf["ref_hash"] = ref_hash
+        inf["canto_cfg"] = canto_cfg
         escribir_json(p, inf)
+
+
+def canto_ajustes(cfg):
+    """Ajustes del canto que cambian el resultado (si cambian, se vuelve a armar el doblaje)."""
+    return [VERSION_CANTO, bool(cfg.get("canto_afinar", True)), float(cfg.get("canto_sala", 0.12)),
+            int(cfg.get("canto_versiones", 3))]
 
 
 def doblar(d, cfg, motor):
@@ -1029,6 +1104,9 @@ def doblar(d, cfg, motor):
     previo = leer_json(w / "informe.json") if (w / "informe.json").exists() else {}
     # si se cambio la voz (muestra subida <-> voz del video) hay que volver a doblar aunque nada sea mas nuevo
     misma_voz = previo.get("ref_hash") == ref_hash or (previo.get("ref_hash") is None and not cfg.get("voz_muestra"))
+    canto_cfg = canto_ajustes(cfg) if tramos_canto else None
+    if tramos_canto and previo.get("canto_cfg") != canto_cfg:
+        misma_voz = False  # cambio la forma de cantar (version del canto, afinacion...): se rehace
     if out_mp4.exists() and not FORZAR and misma_voz and all(out_mp4.stat().st_mtime > f.stat().st_mtime for f in fuentes):
         if cfg.get("quemar_subtitulos") and not cfg.get("ajustar_video") and not audio and (w / "mezcla.wav").exists() and (
                 not quemado.exists() or quemado.stat().st_mtime < out_mp4.stat().st_mtime):
@@ -1050,7 +1128,7 @@ def doblar(d, cfg, motor):
         bloques = [b for b in bloques if not pisa_canto(b, tramos_canto)]
         log(f"  {len(tramos_canto)} parte(s) cantada(s); {antes - len(bloques)} frase(s) hablada(s) quedan bajo la cancion")
         progreso(d.name, 3, 1, "preparando las canciones")
-        cantos = preparar_cantos(d, w, cfg, tramos_canto, ref_wav, ref_txt, src, d.name)
+        cantos = preparar_cantos(d, w, cfg, tramos_canto, ref_wav, ref_txt, src, d.name, motor)
         p0 = 30 if any(c["accion"] == "cantar" for c in cantos) else 2
 
     progreso(d.name, 3, max(1, p0 - 1), "cargando la voz")
@@ -1060,7 +1138,7 @@ def doblar(d, cfg, motor):
     if cfg.get("ajustar_video") or audio:
         doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem,
                                audio=audio, src=src, cantos=cantos)
-        _anotar_voz(w, ref_hash)
+        _anotar_voz(w, ref_hash, canto_cfg)
         progreso(d.name, 3, 100, "listo")
         return
 
