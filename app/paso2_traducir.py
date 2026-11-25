@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from comun import (APP_DIR, ORIGENES, idioma_origen, progreso, archivo_traduccion, carpeta_proceso, ejecutar_principal, escribir_json, escribir_srt,
-                   leer_json, log, log_error, normalizar_palabras)
+                   leer_json, log, log_error, normalizar_palabras, texto_a_cues)
 from textos import bloques_por_oraciones, corregir_segmentos, cues_desde_palabras, palabras_limpias
 
 FORZAR = "--forzar" in sys.argv
@@ -68,6 +68,9 @@ class LLM:
 def _respuesta_simulada(usuario):
     if "<<<LINEAS>>>" in usuario:  # correccion: devuelve las mismas lineas
         return usuario.split("<<<LINEAS>>>", 1)[1].strip()
+    if "<<<LETRA>>>" in usuario:  # letra de cancion: 'N: [TRAD] texto'
+        filas = usuario.split("<<<LETRA>>>", 1)[1].strip().splitlines()
+        return "\n".join(re.sub(r"^(\d+) \(\d+ syllables\): ", r"\1: [TRAD] ", f) for f in filas)
     return "[TRAD] " + usuario.rsplit("<<<FRAGMENTO>>>", 1)[1].strip()
 
 
@@ -336,11 +339,18 @@ def traducir_capitulo(d, cfg, llm, glos):
     else:
         corr = es_corregido(d, es, llm, glos, av_corr, src)
         segs = corr["segmentos"]
+        cantado = tramos_cantados(d, cfg)
         if not (d / "es.srt").exists():
-            cues = cues_desde_palabras(segs)
-            escribir_srt(d / "es.srt", [tuple(c) for c in cues])
+            hablado = [sg for sg in segs if not en_tramo((sg["start"] + sg["end"]) / 2, cantado)]
+            cues = [tuple(c) for c in cues_desde_palabras(hablado)] if hablado else []
+            for tr in (leer_json(d / "canto.json")["tramos"] if cantado else []):
+                for ln in tr["lineas"]:
+                    cues += texto_a_cues(ln["texto"], ln["t0"], max(ln["t1"], ln["t0"] + 1.0))
+            escribir_srt(d / "es.srt", sorted(cues))
             log(f"  Subtitulos del original: {len(cues)}")
         ws = palabras_limpias({"segmentos": segs})
+        if cantado:  # lo cantado no se dobla hablado: se canta (o queda el original)
+            ws = [w for w in ws if not en_tramo((w["s"] + w["e"]) / 2, cantado)]
         bloques = bloques_por_oraciones(ws, max_dur=float(cfg.get("bloque_max_seg", 14.0)) - 1.0)
         if src == cfg["idioma_codigo"]:
             # mismo idioma: no hay que traducir, solo se cambia la voz
@@ -381,6 +391,113 @@ def escribir_revision(d, cfg, es, corr, avisos):
     (d / f"revisar_{cod}.txt").write_text("\n".join(r) + "\n", encoding="utf-8")
 
 
+# ---------------------------------------------------------------- letras de canciones
+def tramos_cantados(d, cfg):
+    p = d / "canto.json"
+    if not cfg.get("cantar") or not p.exists():
+        return []
+    return [(t["t0"], t["t1"]) for t in leer_json(p).get("tramos", [])]
+
+
+def en_tramo(t, tramos, margen=0.25):
+    return any(a - margen <= t <= b + margen for a, b in tramos)
+
+
+SIS_LETRA = (
+    "You translate song lyrics so they can be sung to the ORIGINAL melody. Translate from {src} into natural, "
+    "singable {lang}.{extra}\n"
+    "Rules:\n"
+    "- Keep the meaning, the images and the mood; it does not have to be literal.\n"
+    "- Each line must have about the number of syllables shown in parentheses (plus or minus 1), so it fits the "
+    "same notes. Prefer short, common words.\n"
+    "- Keep exactly the same number of lines, in the same order. If the original rhymes, try to rhyme.\n"
+    "- Answer ONLY with the numbered lines, one per line, as 'N: text'. No notes, no syllable counts."
+)
+
+
+def traducir_letra(lineas, src, cfg, llm):
+    """Traduce las lineas de un trozo cantado buscando la misma cantidad de silabas. Devuelve [trad, ...]."""
+    from canto import silabas
+
+    cod, lang = cfg["idioma_codigo"], cfg["idioma_destino"]
+    extra = {"ru": " Write in Cyrillic.", "es": " Use neutral Latin American Spanish."}.get(cod, "")
+    sis = SIS_LETRA.format(src=ORIGENES.get(src, (src,))[0], lang=lang, extra=extra)
+    sil = [silabas(t, src) for t in lineas]
+
+    def pedir(idx, nota=""):
+        usuario = (nota + f"Lyrics ({len(idx)} lines):\n<<<LETRA>>>\n"
+                   + "\n".join(f"{k + 1} ({sil[i]} syllables): {lineas[i]}" for k, i in enumerate(idx)))
+        resp = llm.chat(sis, usuario, max_new_tokens=60 + 4 * sum(len(lineas[i]) for i in idx) // 3)
+        got = {}
+        for f in resp.splitlines():
+            m = re.match(r"\s*(\d+)\s*[:.)-]\s*(.+)", f)
+            if m and 1 <= int(m.group(1)) <= len(idx):
+                got[idx[int(m.group(1)) - 1]] = re.sub(r"\s*\(\d+\s*syllables?\)\s*", " ", m.group(2)).strip()
+        return got
+
+    trad = {}
+    try:
+        trad = pedir(list(range(len(lineas))))
+    except Exception:
+        log_error("traduccion de la letra")
+    # las que faltan o quedaron muy largas/cortas, otra vez (una sola)
+    malas = [i for i in range(len(lineas)) if not trad.get(i)
+             or abs(silabas(trad[i], cod) - sil[i]) > max(2, round(0.3 * sil[i]))]
+    if malas and not SIMULAR:
+        nota = "Some lines did not fit the melody. Translate again with the syllable count shown, exactly.\n"
+        try:
+            for i, t in pedir(malas, nota).items():
+                if not trad.get(i) or abs(silabas(t, cod) - sil[i]) < abs(silabas(trad[i], cod) - sil[i]):
+                    trad[i] = t
+        except Exception:
+            log_error("traduccion de la letra (segundo intento)")
+    return [trad.get(i) or lineas[i] for i in range(len(lineas))], sil
+
+
+def traducir_canto(d, cfg, llm):
+    """canto_<idioma>.json: la letra de cada parte cantada, en trozos, traducida para cantarla."""
+    from canto import huella, silabas, trozos_de
+
+    p = d / "canto.json"
+    if not cfg.get("cantar") or not p.exists():
+        return
+    det = leer_json(p)
+    cod = cfg["idioma_codigo"]
+    destino = d / f"canto_{cod}.json"
+    h = huella(det.get("tramos", []), bool(cfg.get("voz_muestra")))
+    if destino.exists():
+        prev = leer_json(destino)
+        if not prev.get("auto") or prev.get("curado"):
+            log(f"[{d.name}] letra de las canciones ya revisada, no la toco")
+            return
+        if prev.get("det") == h and not FORZAR:
+            return
+    if not det.get("tramos"):
+        escribir_json(destino, {"auto": True, "idioma": cod, "det": h, "tramos": []})
+        return
+    salida = []
+    for tr in det["tramos"]:
+        # si ya se canta en el idioma del doblaje queda la cancion original (salvo que se cambie la voz)
+        mismo = tr["idioma"] == cod
+        accion = "cantar" if (not mismo or cfg.get("voz_muestra")) else "mantener"
+        trozos = []
+        for tz in trozos_de(tr, float(cfg.get("canto_trozo_seg", 12.0))):
+            orig = [ln["texto"] for ln in tz["lineas"]]
+            if mismo:
+                trad, sil = orig, [silabas(t, tr["idioma"]) for t in orig]
+            else:
+                trad, sil = traducir_letra(orig, tr["idioma"], cfg, llm)
+            trozos.append({"k": tz["k"], "t0": tz["t0"], "t1": tz["t1"],
+                           "lineas": [{"t0": ln["t0"], "t1": ln["t1"], "orig": o, "trad": t, "silabas": s,
+                                       "silabas_trad": silabas(t, cod)}
+                                      for ln, o, t, s in zip(tz["lineas"], orig, trad, sil)]})
+        salida.append({"t0": tr["t0"], "t1": tr["t1"], "idioma": tr["idioma"], "accion": accion, "trozos": trozos})
+        log(f"[{d.name}] Canción {tr['t0']:.0f}-{tr['t1']:.0f}s ({tr['idioma']}): "
+            + ("queda la original" if accion == "mantener" else
+               " / ".join(ln["trad"] for tz in trozos for ln in tz["lineas"])[:200]))
+    escribir_json(destino, {"auto": True, "idioma": cod, "det": h, "tramos": salida})
+
+
 def main(cfg):
     proc = carpeta_proceso(cfg)
     caps = sorted(p for p in proc.iterdir() if p.is_dir() and (p / "es.json").exists())
@@ -395,6 +512,7 @@ def main(cfg):
     for d in caps:
         try:
             traducir_capitulo(d, cfg, llm, glos)
+            traducir_canto(d, cfg, llm)
         except Exception:
             errores += 1
             log_error(d.name)

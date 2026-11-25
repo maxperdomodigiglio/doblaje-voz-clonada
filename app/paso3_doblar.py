@@ -556,6 +556,148 @@ def ensamblar(bloques, clips, voz_orig, dur_total, cfg):
 
 
 # ---------------------------------------------------------------- modo "ajustar video": el audio manda, el video se acelera
+# ---------------------------------------------------------------- partes cantadas
+VERSION_CANTO = 1
+
+
+def cargar_cantos(d, cfg):
+    p = d / f"canto_{cfg.get('idioma_codigo', 'en')}.json"
+    if not cfg.get("cantar") or not p.exists():
+        return [], None
+    return leer_json(p).get("tramos", []), p
+
+
+def pisa_canto(b, tramos, margen=0.25):
+    """Un bloque hablado que cae sobre una cancion no se dice: ahi va la cancion."""
+    for t in tramos:
+        solape = min(b["end"], t["t1"] + margen) - max(b["start"], t["t0"] - margen)
+        if solape > 0 and (solape > 0.3 * (b["end"] - b["start"]) or t["t0"] <= (b["start"] + b["end"]) / 2 <= t["t1"]):
+            return True
+    return False
+
+
+def _ref_canto(voz, tr, wc, i):
+    """Muestra del timbre del cantante: la linea de 3 a 10 s con mas voz."""
+    import soundfile as sf
+    lineas = [ln for tz in tr["trozos"] for ln in tz["lineas"]]
+    cands = [ln for ln in lineas if 3.0 <= ln["t1"] - ln["t0"] <= 10.0] or lineas
+    mejor = max(cands, key=lambda ln: rms_activo(voz[int(ln["t0"] * SR):int(ln["t1"] * SR)]) *
+                min(1.0, (ln["t1"] - ln["t0"]) / 4.0))
+    a, b = max(0.0, mejor["t0"] - 0.05), min(mejor["t1"] + 0.15, mejor["t0"] + 12.0)
+    ref = wc / f"ref_{i}.wav"
+    sf.write(str(ref), voz[int(a * SR):int(b * SR)], SR)
+    return ref, mejor["orig"]
+
+
+def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap):
+    """Canta cada trozo traducido con YingMusic-Singer (en su entorno) y arma la voz de cada tramo cantado.
+    Devuelve [{"t0", "t1", "voz", "accion"}]; lo que no se pudo cantar queda con la voz original."""
+    import soundfile as sf
+
+    from canto import correr_motor, huella, motor_instalado, REPO
+
+    voz, sr_v = sf.read(str(d / "voz.flac"), dtype="float32")
+    if voz.ndim > 1:
+        voz = voz.mean(1)
+    wc = w / "canto"
+    wc.mkdir(parents=True, exist_ok=True)
+    idx_p = wc / "indice.json"
+    indice = leer_json(idx_p) if idx_p.exists() else {}
+    cod = cfg.get("idioma_codigo", "en")
+    nfe = int(cfg.get("canto_pasos", 32))
+    hay_motor = SIMULAR or motor_instalado()
+    if not hay_motor and any(t["accion"] == "cantar" for t in tramos):
+        log("  El canto no esta instalado (Pinokio: 'Instalar canto'): las canciones quedan con la voz original")
+    items, salidas = [], []
+    for i, tr in enumerate(tramos):
+        if tr["accion"] != "cantar" or not hay_motor:
+            continue
+        if cfg.get("voz_muestra"):
+            ref, rtxt, rcod = ref_wav, ref_txt, src
+        else:
+            ref, rtxt = _ref_canto(voz, tr, wc, i)
+            rcod = tr["idioma"]
+        rh = hashlib.md5(Path(ref).read_bytes()).hexdigest()[:10]
+        for tz in tr["trozos"]:
+            texto = " ".join(ln["trad"] for ln in tz["lineas"]).strip()
+            if not texto:
+                continue
+            mel = wc / f"melodia_{i}_{tz['k']}.wav"
+            sf.write(str(mel), voz[int(tz["t0"] * SR):int(tz["t1"] * SR)], SR)
+            out = wc / f"canto_{i}_{tz['k']}.wav"
+            h = huella(VERSION_CANTO, texto, cod, rtxt, rh, tz["t0"], tz["t1"], nfe)
+            salidas.append((i, tz, out, h))
+            if out.exists() and indice.get(out.name) == h and not FORZAR:
+                continue
+            items.append({"id": out.name, "melodia": str(mel), "ref": str(ref), "ref_texto": rtxt, "ref_idioma": rcod,
+                          "texto": texto, "idioma": cod, "salida": str(out), "semilla": 1000 + 97 * i + tz["k"],
+                          "_h": h})
+    if items:
+        log(f"  Cantando {len(items)} trozo(s) en {cfg.get('idioma_nombre', cod)}...")
+        if SIMULAR:
+            res = {}
+            for it in items:
+                y, _ = sf.read(it["melodia"], dtype="float32")
+                sf.write(it["salida"], np.stack([y, y], 1) * 0.9, SR)
+                res[it["id"]] = {"ok": True}
+        else:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            trabajo = wc / "trabajo.json"
+            escribir_json(trabajo, {"repo": str(REPO), "modelo": cfg.get("canto_modelo", "ASLP-lab/YingMusic-Singer-Plus"),
+                                    "nfe": nfe, "cfg": float(cfg.get("canto_cfg", 3.0)), "cap": cap, "pct": [2, 30],
+                                    "items": [{k: v for k, v in it.items() if k != "_h"} for it in items]})
+            try:
+                res = correr_motor(trabajo)
+            except Exception:
+                log_error("cantar (las canciones quedan con la voz original)")
+                res = {}
+        for it in items:
+            if res.get(it["id"], {}).get("ok"):
+                indice[it["id"]] = it["_h"]
+            else:
+                indice.pop(it["id"], None)
+                log(f"  No se pudo cantar {it['id']}: {res.get(it['id'], {}).get('error', 'sin resultado')}")
+        escribir_json(idx_p, indice)
+
+    resultado = []
+    for i, tr in enumerate(tramos):
+        a = int(round(tr["t0"] * SR))
+        base = voz[a:a + int(round((tr["t1"] - tr["t0"]) * SR))].copy()
+        cantados = 0
+        for (j, tz, out, h) in salidas:
+            if j != i or not out.exists() or indice.get(out.name) != h:
+                continue
+            y, sr_y = sf.read(str(out), dtype="float32")
+            if y.ndim > 1:
+                y = y.mean(1)
+            if sr_y != SR:
+                import librosa
+                y = librosa.resample(y, orig_sr=sr_y, target_sr=SR)
+            i0 = int(round((tz["t0"] - tr["t0"]) * SR))
+            n = min(int(round((tz["t1"] - tz["t0"]) * SR)), len(base) - i0)
+            if n <= 0:
+                continue
+            y = np.pad(y, (0, max(0, n - len(y))))[:n]
+            r_o, r_n = rms_activo(base[i0:i0 + n]), rms_activo(y)
+            if r_n > 0 and r_o > 0:
+                y = y * (r_o / r_n)
+            fade = min(int(0.03 * SR), n // 4)
+            env = np.ones(n, np.float32)
+            if fade > 0:
+                env[:fade] = np.linspace(0, 1, fade)
+                env[-fade:] = np.linspace(1, 0, fade)
+            base[i0:i0 + n] = base[i0:i0 + n] * (1 - env) + y * env
+            cantados += 1
+        resultado.append({"t0": tr["t0"], "t1": tr["t1"], "voz": base, "accion": tr["accion"],
+                          "cantados": cantados, "lineas": [ln for tz in tr["trozos"] for ln in tz["lineas"]]})
+    return resultado
+
+
 def fps_video(video):
     import re
     r = __import__("subprocess").run([ffmpeg_exe(), "-hide_banner", "-i", str(video)], capture_output=True, text=True,
@@ -598,6 +740,14 @@ def plan_ajuste(bloques, dclips, dur_total, fondo_mono, fps, cfg):
         segs.append({"a": 0.0, "b": a, "f": 1.0, "n": a, "tipo": "libre"})
     for i, b in enumerate(bloques):
         sig = bloques[i + 1]["start"] - pre if i + 1 < len(bloques) else None
+        if b.get("fijo"):  # parte cantada: va a velocidad normal, con su musica
+            z = max(min(dur_total, rnd(b["end"])), a + q)
+            segs.append({"a": a, "b": z, "f": 1.0, "n": z - a, "tipo": "canto", "i": i})
+            fin_libre = max(z, rnd(sig) if sig is not None else dur_total)
+            if fin_libre - z > q / 2:
+                segs.append({"a": z, "b": fin_libre, "f": 1.0, "n": fin_libre - z, "tipo": "libre"})
+            a = fin_libre
+            continue
         fin_habla = b["end"]
         corte = None
         if sig is None:
@@ -697,7 +847,7 @@ def video_ajustado(video, segs, mezcla, srt, destino, fps, sub_cod="es"):
 
 
 def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem,
-                           audio=False, src="es"):
+                           audio=False, src="es", cantos=()):
     """Modo 'ajustar video': la voz doblada va a velocidad natural y el video (o el fondo, si es un audio) se
     acelera o frena por tramos para acompanarla."""
     import soundfile as sf
@@ -712,7 +862,15 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
         cfg = dict(cfg, video_vel_max=cfg.get("audio_vel_max", 3.0), video_vel_min=cfg.get("audio_vel_min", 0.5))
     else:
         fps = fps_video(video)
-    segs = plan_ajuste(bloques, [len(c) / SR for c in clips], dur_total, fondo.mean(1), fps, cfg)
+    # habla y canciones en orden: las canciones van a velocidad normal
+    eventos = sorted([{"start": b["start"], "end": b["end"], "bi": i} for i, b in enumerate(bloques)] +
+                     [{"start": c["t0"], "end": c["t1"], "ci": j, "fijo": True} for j, c in enumerate(cantos)],
+                     key=lambda e: e["start"])
+    if eventos:
+        dclips = [len(clips[e["bi"]]) / SR if "bi" in e else e["end"] - e["start"] for e in eventos]
+        segs = plan_ajuste(eventos, dclips, dur_total, fondo.mean(1), fps, cfg)
+    else:
+        segs = [{"a": 0.0, "b": dur_total, "f": 1.0, "n": dur_total, "tipo": "libre", "T": 0.0}]
     total = segs[-1]["T"] + segs[-1]["n"]
     N = int(round(total * SR))
     progreso(d.name, 3, 82, "mezclando la voz con la música")
@@ -723,7 +881,7 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
     niveles = [rms_activo(voz_orig[int(b["start"] * SR):int(b["end"] * SR)]) for b in bloques]
     med = float(np.median([n_ for n_ in niveles if n_ > 0]) or 0.1)
     pista = np.zeros(N + SR * 5, np.float32)
-    habla = {sg["i"]: sg for sg in segs if sg["tipo"] == "habla"}
+    habla = {eventos[sg["i"]]["bi"]: sg for sg in segs if sg["tipo"] == "habla"}
     cursor, colocados = 0.0, []
     for i, (b, clip) in enumerate(zip(bloques, clips)):
         sg = habla[i]
@@ -762,11 +920,17 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
         pista *= r_orig / r_new
     fondo_n = fondo_n * (10 ** (float(cfg.get("fondo_ajuste_db", 0)) / 20))
     fondo_n = ducking(fondo_n, pista, float(cfg.get("atenuar_fondo_db", 6)))
-    mezcla = fondo_n + pista[:, None] + voz_libre[:, None]
+    # canciones: la voz cantada va en su lugar exacto, con su volumen original y sin bajar la musica
+    pista_canto = np.zeros(N, np.float32)
+    for c in cantos:
+        i0 = int(round(mapear(c["t0"], segs) * SR))
+        n = max(0, min(len(c["voz"]), N - i0))
+        pista_canto[i0:i0 + n] += c["voz"][:n]
+    mezcla = fondo_n + pista[:, None] + pista_canto[:, None] + voz_libre[:, None]
     pico = np.max(np.abs(mezcla))
     if pico > 0.99:
         mezcla *= 0.99 / pico
-    sf.write(str(w / "voz_doblada.wav"), pista, SR, subtype="PCM_16")
+    sf.write(str(w / "voz_doblada.wav"), pista + pista_canto, SR, subtype="PCM_16")
     sf.write(str(w / "mezcla_pre.wav"), mezcla, SR, subtype="FLOAT")
     lufs_in = loudnorm(w / "mezcla_pre.wav", w / "mezcla.wav", float(cfg.get("loudness_lufs", -14)))
     (w / "mezcla_pre.wav").unlink(missing_ok=True)
@@ -783,6 +947,12 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
     cues_en = []
     for b, c in zip(bloques, colocados):
         cues_en += texto_a_cues(b["en"], c["t0"], c["t1"])
+    for c in cantos:  # la letra que se canta (traducida, o la original si quedo la cancion original)
+        for ln in c.get("lineas", []):
+            txt = ln["trad"] if c["accion"] == "cantar" and c.get("cantados") else ln["orig"]
+            na, nz = mapear(ln["t0"], segs), mapear(ln["t1"], segs)
+            cues_en += texto_a_cues(txt, na, max(nz, na + 1.0))
+    cues_en.sort(key=lambda x: x[0])
     srt_en = w / "traduccion.srt"
     escribir_srt(srt_en, cues_en)
 
@@ -812,6 +982,8 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
                                        "salida": out_mp4.name, "duracion_original": dur_total,
                                        "duracion_nueva": total, "tramos": segs, "bloques": informe,
                                        "colocados": colocados, "revisar_wer": [x["id"] for x in flojos],
+                                       "canciones": [{"t0": c["t0"], "t1": c["t1"], "accion": c["accion"],
+                                                      "trozos_cantados": c.get("cantados", 0)} for c in cantos],
                                        "acelerados": [(c["id"], c["factor"]) for c in colocados if c["factor"] > 1],
                                        "desfasados": [(c["id"], c["desfase"]) for c in desfasados]})
     log(f"[{d.name}] LISTO -> {out_mp4.name} | {dur_total:.0f}s -> {total:.0f}s | bloques a revisar: "
@@ -850,6 +1022,9 @@ def doblar(d, cfg, motor):
         out_mp4 = sal / f"{stem} [{SUFIJO}].mp4"
     quemado = sal / f"{stem} [{SUFIJO}] subs {sub_cod.upper()}.mp4"
     fuentes = [trad, srt_es, ref_wav]
+    tramos_canto, p_canto = cargar_cantos(d, cfg) if (cfg.get("ajustar_video") or audio) else ([], None)
+    if p_canto and tramos_canto:  # sin canciones no hace falta volver a doblar
+        fuentes.append(p_canto)
     ref_hash = hashlib.md5(ref_wav.read_bytes() + ref_txt.encode()).hexdigest()[:10]
     previo = leer_json(w / "informe.json") if (w / "informe.json").exists() else {}
     # si se cambio la voz (muestra subida <-> voz del video) hay que volver a doblar aunque nada sea mas nuevo
@@ -869,14 +1044,22 @@ def doblar(d, cfg, motor):
         return
     log(f"[{d.name}] DOBLANDO: {video.name}" + (f" (audio en {ORIGENES.get(src, (src, src))[1]})" if src != "es" else ""))
     bloques = en["bloques"]
+    cantos, p0 = [], 2
+    if tramos_canto:
+        antes = len(bloques)
+        bloques = [b for b in bloques if not pisa_canto(b, tramos_canto)]
+        log(f"  {len(tramos_canto)} parte(s) cantada(s); {antes - len(bloques)} frase(s) hablada(s) quedan bajo la cancion")
+        progreso(d.name, 3, 1, "preparando las canciones")
+        cantos = preparar_cantos(d, w, cfg, tramos_canto, ref_wav, ref_txt, src, d.name)
+        p0 = 30 if any(c["accion"] == "cantar" for c in cantos) else 2
 
-    progreso(d.name, 3, 1, "cargando la voz")
+    progreso(d.name, 3, max(1, p0 - 1), "cargando la voz")
     clips, informe = generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt,
-                                     avance=lambda i, n: progreso(d.name, 3, 2 + 78 * i / max(n, 1),
+                                     avance=lambda i, n: progreso(d.name, 3, p0 + (80 - p0) * i / max(n, 1),
                                                                   f"generando la voz: frase {i + 1} de {n}"))
     if cfg.get("ajustar_video") or audio:
         doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem,
-                               audio=audio, src=src)
+                               audio=audio, src=src, cantos=cantos)
         _anotar_voz(w, ref_hash)
         progreso(d.name, 3, 100, "listo")
         return

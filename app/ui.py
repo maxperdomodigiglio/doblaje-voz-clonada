@@ -13,6 +13,7 @@ from pathlib import Path
 
 import gradio as gr
 
+from canto import motor_instalado
 from comun import APP_DIR, EXT_AUDIO, EXT_MEDIOS, IDIOMAS, archivo_traduccion, slug_de
 
 AJUSTES_UI = APP_DIR / "ui_ajustes.json"
@@ -64,6 +65,8 @@ def cargar_ajustes():
     aj["contexto"] = pc.get("contexto", "")
     if pc.get("idioma_origen") in UI_DE_ORIGEN:
         aj["origen"] = UI_DE_ORIGEN[pc["idioma_origen"]]
+    if "cantar" in pc:
+        aj["cantar"] = bool(pc["cantar"])
     return aj
 
 
@@ -118,7 +121,13 @@ def videos_de(carpeta, cod):
                 auto = bool(data.get("auto") and not data.get("curado"))
             except Exception:
                 pass
-        out.append({"nombre": v.stem, "slug": d.name, "audio": audio,
+        canciones = 0
+        if (d / "canto.json").exists():
+            try:
+                canciones = len(json.loads((d / "canto.json").read_text(encoding="utf-8")).get("tramos", []))
+            except Exception:
+                pass
+        out.append({"nombre": v.stem, "slug": d.name, "audio": audio, "canciones": canciones,
                     "hecho": {1: (d / "es.json").exists(), 2: t.exists(), 3: any(f.exists() for f in finales)},
                     "auto": auto})
     return out
@@ -205,7 +214,8 @@ def panel(carpeta, idioma):
         partes.append(
             f'<div class="video{" activo" if actual and corriendo else ""}"><div class="fila">'
             f'<span class="nombre" title="{html.escape(v["nombre"])}">{icono} {html.escape(v["nombre"])}</span>'
-            f'<span class="pct">{pct:.0f}%</span></div>'
+            + (f'<span class="musica" title="partes cantadas">🎵 {v["canciones"]}</span>' if v.get("canciones") else "")
+            + f'<span class="pct">{pct:.0f}%</span></div>'
             f'<div class="barra"><div class="relleno{rayas}" style="width:{pct:.1f}%"></div></div>'
             f'<div class="pasos">{"".join(chips)}</div>{det}</div>')
     return "".join(partes)
@@ -337,7 +347,7 @@ def _registro(salida):
     return "\n".join(l.lstrip("~") for l in salida)
 
 
-def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=ORIGEN_AUTO):
+def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=ORIGEN_AUTO, cantar=False):
     carpeta = (carpeta or "").strip().strip('"')
     if not carpeta or not Path(carpeta).is_dir():
         raise gr.Error("Elegí primero la carpeta donde están los videos o audios.")
@@ -351,11 +361,11 @@ def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=
         raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine, o tocá Detener.")
     salida = deque(maxlen=500)
     try:
-        guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, origen=origen)
+        guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, origen=origen, cantar=bool(cantar))
         proc = Path(carpeta) / "_proceso"
         proc.mkdir(parents=True, exist_ok=True)
         ajustes = {"carpeta_videos": carpeta, "idioma_codigo": cod,
-                   "idioma_origen": ORIGENES_UI.get(origen, "auto")}
+                   "idioma_origen": ORIGENES_UI.get(origen, "auto"), "cantar": bool(cantar and motor_instalado())}
         if (contexto or "").strip():
             ajustes["contexto"] = contexto.strip()
         if voz == VOZ_MUESTRA and 3 in lista:
@@ -446,6 +456,7 @@ CSS = """
 .video.activo {border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.15);}
 .nombre {font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;}
 .pct {font-weight: 700; font-size: 14px; color: #6366f1;}
+.musica {font-size: 12px; font-weight: 600; color: #a855f7; background: #f3e8ff; border-radius: 999px; padding: 1px 8px; margin-left: auto; margin-right: 8px;}
 .pasos {display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;}
 .paso {font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid rgba(100,116,139,.25);}
 .paso.ok {background: rgba(22,163,74,.12); color: #15803d; border-color: rgba(22,163,74,.3);}
@@ -482,6 +493,12 @@ def armar():
                                       file_types=["audio", "video"], type="filepath",
                                       visible=aj["voz"] == VOZ_MUESTRA, height=110)
                 info_voz = gr.Markdown(visible=aj["voz"] == VOZ_MUESTRA)
+                hay_canto = motor_instalado()
+                cantar = gr.Checkbox(
+                    label="🎵 Cantar las canciones: detecta las partes cantadas y las canta traducidas, "
+                          "con la misma melodía",
+                    value=bool(aj.get("cantar", True)) and hay_canto, interactive=hay_canto,
+                    info=None if hay_canto else "Para usarlo, en Pinokio tocá '🎵 Instalar canto' (una sola vez).")
                 with gr.Accordion("⚙️ Opciones avanzadas", open=False):
                     origen = gr.Dropdown(list(ORIGENES_UI), value=aj["origen"],
                                          label="Idioma en que hablan los videos/audios originales")
@@ -516,30 +533,31 @@ def armar():
             return gr.update(visible=v == VOZ_MUESTRA), gr.update(visible=v == VOZ_MUESTRA, value=txt)
 
         def cambio_carpeta(c, ult):
-            # al pasar a otra carpeta se cargan su tema y su idioma original (si ya se usó)
+            # al pasar a otra carpeta se cargan su tema, su idioma original y si se cantan las canciones
             if (c or "") == (ult or ""):
-                return gr.update(), gr.update(), ult
+                return gr.update(), gr.update(), gr.update(), ult
             pc = ajustes_carpeta(c)
             org = UI_DE_ORIGEN.get(pc.get("idioma_origen"), ORIGEN_AUTO)
-            return gr.update(value=pc.get("contexto", "")), gr.update(value=org), c
+            can = gr.update(value=bool(pc["cantar"])) if ("cantar" in pc and hay_canto) else gr.update()
+            return gr.update(value=pc.get("contexto", "")), gr.update(value=org), can, c
 
         voz.change(ver_voz, [voz, carpeta], [archivo_voz, info_voz])
         b_elegir.click(elegir_carpeta, carpeta, carpeta).then(panel, [carpeta, idioma], tablero) \
             .then(ver_voz, [voz, carpeta], [archivo_voz, info_voz]) \
-            .then(cambio_carpeta, [carpeta, ultima], [contexto, origen, ultima])
+            .then(cambio_carpeta, [carpeta, ultima], [contexto, origen, cantar, ultima])
         carpeta.submit(panel, [carpeta, idioma], tablero).then(cambio_carpeta, [carpeta, ultima],
-                                                               [contexto, origen, ultima])
+                                                               [contexto, origen, cantar, ultima])
         carpeta.blur(panel, [carpeta, idioma], tablero).then(cambio_carpeta, [carpeta, ultima],
-                                                             [contexto, origen, ultima])
+                                                             [contexto, origen, cantar, ultima])
         idioma.change(panel, [carpeta, idioma], tablero)
         b_ref.click(panel, [carpeta, idioma], tablero)
 
         def hacer(pasos):
-            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_):
-                yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_)
+            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_):
+                yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_)
             return correr_pasos
 
-        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen]
+        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen, cantar]
         for boton, pasos in ((b_todo, (1, 2, 3)), (b1, (1,)), (b2, (2,)), (b3, (3,))):
             boton.click(hacer(pasos), entradas, [tablero, registro, b_pausa])
         b_pausa.click(pausar_continuar, None, b_pausa, concurrency_limit=None, queue=False)

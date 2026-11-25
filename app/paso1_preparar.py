@@ -177,15 +177,28 @@ def _detectar_idioma(model, y):
     return max(total, key=total.get)
 
 
-def transcribir(voz_path, cfg):
-    import librosa
+_WHISPER = {}
+
+
+def whisper_modelo(cfg):
+    """Whisper se carga una sola vez por corrida (sirve para todos los videos y para las partes cantadas)."""
     import torch
     import whisper
 
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
     nombre = cfg.get("whisper_modelo", "large-v3")
-    log(f"  Whisper ({nombre}) en {dev}...")
-    model = whisper.load_model(nombre, device=dev, download_root=str(APP_DIR / "modelos" / "whisper"))
+    if nombre not in _WHISPER:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        log(f"  Whisper ({nombre}) en {dev}...")
+        _WHISPER[nombre] = whisper.load_model(nombre, device=dev, download_root=str(APP_DIR / "modelos" / "whisper"))
+    return _WHISPER[nombre]
+
+
+def transcribir(voz_path, cfg):
+    import librosa
+    import torch
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisper_modelo(cfg)
     y, _ = librosa.load(str(voz_path), sr=16000, mono=True)
     y = y.astype(np.float32)
     dur = len(y) / 16000
@@ -229,7 +242,6 @@ def transcribir(voz_path, cfg):
             segmentos = [sg for sg in segmentos if not (a - 0.05 <= (sg["start"] + sg["end"]) / 2 <= b + 0.05)]
             segmentos = sorted(segmentos + nuevos, key=lambda sg: sg["start"])
 
-    del model
     if dev == "cuda":
         torch.cuda.empty_cache()
 
@@ -371,6 +383,46 @@ def rehacer_ventanas(d, cfg):
     log(f"[{d.name}] LISTO re-transcripcion")
 
 
+def detectar_canto(d, cfg, slug):
+    """Busca las partes cantadas y las vuelve a transcribir en su idioma. Resultado en <d>/canto.json."""
+    import librosa
+
+    from canto import VERSION_DET, lineas_de, puntajes, tramos_desde
+
+    y, _ = librosa.load(str(d / "voz.flac"), sr=16000, mono=True)
+    y = y.astype(np.float32)
+    progreso(slug, 1, 93, "buscando partes cantadas")
+    log(f"[{slug}] Buscando partes cantadas...")
+    vent = puntajes(y, cfg, avance=lambda i, n: progreso(slug, 1, 93 + 4 * i / max(n, 1), "buscando partes cantadas"))
+    tramos = []
+    for a, b in tramos_desde(vent, y, cfg):
+        model = whisper_modelo(cfg)
+        trozo = y[int(a * 16000):int(b * 16000)]
+        try:
+            idioma = _detectar_idioma(model, trozo)
+        except Exception:
+            idioma = cfg.get("idioma_origen") if cfg.get("idioma_origen") not in (None, "", "auto") else "es"
+        rr = model.transcribe(trozo, language=idioma, task="transcribe", word_timestamps=True,
+                              fp16=(model.device.type == "cuda"), condition_on_previous_text=False, verbose=None)
+        lineas = lineas_de(_segmentos_de(rr, offset=a, filtrar=False))
+        if not lineas:
+            log(f"  {a:.1f}-{b:.1f}s: canto sin letra (queda el original)")
+            continue
+        texto = " / ".join(ln["texto"] for ln in lineas)
+        log(f"  Canto {a:.1f}-{b:.1f}s ({idioma}): {texto[:160]}")
+        tramos.append({"t0": a, "t1": b, "idioma": idioma, "texto": texto, "lineas": lineas})
+    if not tramos:
+        log("  No hay partes cantadas")
+    escribir_json(d / "canto.json", {"version": VERSION_DET, "tramos": tramos, "ventanas": vent})
+    return tramos
+
+
+def canto_al_dia(d):
+    from canto import VERSION_DET
+    p = d / "canto.json"
+    return p.exists() and leer_json(p).get("version", 0) >= VERSION_DET
+
+
 VERSION = 3  # sube cuando mejora la transcripcion: los capitulos viejos se re-transcriben solos
 
 
@@ -390,6 +442,11 @@ def preparar(video, cfg):
             d = proc / slug
             previo = leer_json(d / "es.json") if (d / "es.json").exists() else {}
         if previo.get("video") == video.name and previo.get("version", 1) >= VERSION:
+            if cfg.get("cantar") and not canto_al_dia(d):
+                try:
+                    detectar_canto(d, cfg, slug)
+                except Exception:
+                    log_error(f"buscar partes cantadas en {video.name} (se dobla todo como habla)")
             log(f"[{slug}] ya preparado, salteo ({video.name})")
             progreso(slug, 1, 100, "ya estaba preparado")
             return
@@ -410,9 +467,18 @@ def preparar(video, cfg):
     segmentos = transcribir(d / "voz.flac", cfg)
     if not segmentos:
         raise RuntimeError("Whisper no encontro habla en el video")
-    progreso(slug, 1, 92, "eligiendo la muestra de voz")
     bloques = armar_bloques(segmentos, cfg.get("bloque_max_seg", 14.0))
-    ref = elegir_referencia(bloques, segmentos, d / "voz.flac", d, cfg)
+    cantados = []
+    if cfg.get("cantar"):
+        try:
+            cantados = [(t["t0"], t["t1"]) for t in detectar_canto(d, cfg, slug)]
+        except Exception:
+            log_error(f"buscar partes cantadas en {video.name} (se dobla todo como habla)")
+    progreso(slug, 1, 97, "eligiendo la muestra de voz")
+    # la muestra para clonar la voz hablada sale de lo hablado, no de una cancion
+    hablado = [sg for sg in segmentos if not any(a - 0.5 <= (sg["start"] + sg["end"]) / 2 <= b + 0.5
+                                                   for a, b in cantados)]
+    ref = elegir_referencia(bloques, hablado or segmentos, d / "voz.flac", d, cfg)
     log(f"  {len(segmentos)} segmentos, {len(bloques)} bloques; referencia de voz {ref['start']:.1f}-{ref['end']:.1f}s")
 
     escribir_json(d / "es.json", {"version": VERSION, "video": video.name, "slug": slug, "duracion": round(dur, 3),
