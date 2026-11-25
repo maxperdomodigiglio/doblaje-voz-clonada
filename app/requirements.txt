@@ -1,0 +1,8 @@
+qwen-tts==0.1.1
+openai-whisper
+demucs==4.0.1
+julius
+soundfile
+librosa
+imageio-ffmpeg
+num2words
