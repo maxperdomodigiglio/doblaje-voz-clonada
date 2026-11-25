@@ -26,6 +26,10 @@ de este repositorio y después tocá **Instalar** en la app. Tarda un rato.
 4. **▶ Hacer todo**. Los resultados quedan en la subcarpeta `salida`:
    `... [EN].mp4` (subtítulos seleccionables), `... [EN] subs ES.mp4` (subtítulos grabados) y los `.srt`.
 
+Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que falta.
+- **⏸ Pausar** frena todo y libera la placa de video y el procesador; **▶ Continuar** sigue en el mismo punto.
+- **⏹ Detener** corta y libera también la memoria; después, **Hacer todo** sigue desde donde quedó.
+
 La primera vez se descargan los modelos (Whisper, Demucs, Qwen3-TTS y el traductor local, unos 16 GB).
 En `_proceso/capNN/revisar_XX.txt` queda una lista de lo dudoso de cada video, para revisarlo.
 
