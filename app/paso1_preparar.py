@@ -12,7 +12,7 @@ import zlib
 
 import numpy as np
 
-from comun import (APP_DIR, carpeta_proceso, duracion_media, ejecutar_principal, escribir_json, escribir_srt,
+from comun import (APP_DIR, progreso, carpeta_proceso, duracion_media, ejecutar_principal, escribir_json, escribir_srt,
                    ffmpeg, leer_json, listar_videos, log, log_error, slug_de, texto_a_cues)
 
 FORZAR = "--forzar" in sys.argv
@@ -349,7 +349,9 @@ def preparar(video, cfg):
     slug = slug_de(video.name)
     d = proc / slug
     if (d / "rehacer.json").exists() and (d / "es.json").exists():
+        progreso(slug, 1, 30, "re-escuchando frases dudosas")
         rehacer_ventanas(d, cfg)
+        progreso(slug, 1, 100, "listo")
         return
     if (d / "es.json").exists() and not FORZAR:
         previo = leer_json(d / "es.json")
@@ -359,21 +361,26 @@ def preparar(video, cfg):
             previo = leer_json(d / "es.json") if (d / "es.json").exists() else {}
         if previo.get("video") == video.name and previo.get("version", 1) >= VERSION:
             log(f"[{slug}] ya preparado, salteo ({video.name})")
+            progreso(slug, 1, 100, "ya estaba preparado")
             return
     d.mkdir(parents=True, exist_ok=True)
     log(f"[{slug}] PREPARANDO: {video.name}")
+    progreso(slug, 1, 2, "extrayendo el audio")
 
     dur = duracion_media(video)
     wav = d / "audio_orig.wav"
     if FORZAR or not ((d / "voz.flac").exists() and (d / "fondo.flac").exists()):
         log("  Extrayendo audio...")
         ffmpeg("-i", video, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", wav)
+        progreso(slug, 1, 8, "separando la voz de la música")
         separar(wav, d / "voz.flac", d / "fondo.flac", cfg)
     else:
         log("  Voz y fondo ya separados, reutilizo")
+    progreso(slug, 1, 40, "transcribiendo lo que se dice")
     segmentos = transcribir(d / "voz.flac", cfg)
     if not segmentos:
         raise RuntimeError("Whisper no encontro habla en el video")
+    progreso(slug, 1, 92, "eligiendo la muestra de voz")
     bloques = armar_bloques(segmentos, cfg.get("bloque_max_seg", 14.0))
     ref = elegir_referencia(bloques, segmentos, d / "voz.flac", d, cfg)
     log(f"  {len(segmentos)} segmentos, {len(bloques)} bloques; referencia de voz {ref['start']:.1f}-{ref['end']:.1f}s")
@@ -389,6 +396,7 @@ def preparar(video, cfg):
     except OSError:
         pass
     log(f"[{slug}] LISTO paso 1 -> {d}")
+    progreso(slug, 1, 100, "listo")
 
 
 def main(cfg):

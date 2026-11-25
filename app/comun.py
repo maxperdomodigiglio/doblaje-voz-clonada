@@ -126,6 +126,15 @@ def log(*msg):
             f.write(line + "\n")
 
 
+def progreso(cap, paso, pct, detalle=""):
+    """Avance para la interfaz (no va al log): una linea '@@P {json}' por la salida estandar."""
+    try:
+        print("@@P " + json.dumps({"cap": str(cap), "paso": paso, "pct": round(max(0.0, min(100.0, float(pct))), 1),
+                                   "det": detalle}, ensure_ascii=False), flush=True)
+    except Exception:
+        pass
+
+
 def log_error(contexto):
     log(f"ERROR en {contexto}:\n" + traceback.format_exc())
 

@@ -9,7 +9,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from comun import carpeta_proceso, ejecutar_principal, escribir_json, ffmpeg, leer_json, log
+from comun import carpeta_proceso, ejecutar_principal, escribir_json, ffmpeg, leer_json, log, progreso
 
 ARCHIVO = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--archivo=")), None)
 
@@ -31,6 +31,7 @@ def preparar_muestra(cfg, archivo):
     if origen.resolve() != copia.resolve():
         shutil.copyfile(origen, copia)
     log(f"Preparando la muestra de voz: {origen.name}")
+    progreso("voz", "voz", 5, "preparando la muestra de voz")
     wav = d / "muestra.wav"
     ffmpeg("-i", copia, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", wav)
     voz = d / "voz.flac"
@@ -38,6 +39,7 @@ def preparar_muestra(cfg, archivo):
         separar(wav, voz, d / "fondo.flac", cfg)  # saca musica y ruido de fondo
     else:
         ffmpeg("-i", wav, "-ac", "1", voz)
+    progreso("voz", "voz", 50, "transcribiendo la muestra")
     cfg_t = dict(cfg, idioma_origen=None, whisper_prompt="")  # la muestra puede estar en cualquier idioma
     segmentos = transcribir(voz, cfg_t)
     if not segmentos:
@@ -47,6 +49,7 @@ def preparar_muestra(cfg, archivo):
     for f in (wav, d / "fondo.flac"):
         f.unlink(missing_ok=True)
     dur = ref["end"] - ref["start"]
+    progreso("voz", "voz", 100, "muestra lista")
     log(f"Muestra lista: {dur:.1f}s de voz -> \"{ref['texto'][:80]}\"")
     if dur < 6:
         log("  OJO: la muestra es corta (ideal 10-15 s de una sola persona hablando, sin musica)")

@@ -1,6 +1,9 @@
-"""Interfaz del Doblaje Gregorio: elegir carpeta, idioma y voz, y correr los pasos 1 -> 2 -> 3 sin API key."""
+"""Interfaz del doblaje: carpeta, idioma y voz; corre los pasos 1 -> 2 -> 3 sin API key,
+con progreso por video, pausa y reanudacion."""
+import html
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -13,17 +16,22 @@ import gradio as gr
 from comun import APP_DIR, EXT_VIDEO, IDIOMAS, slug_de
 
 AJUSTES_UI = APP_DIR / "ui_ajustes.json"
-NOMBRE_A_COD = {v[3]: k for k, v in IDIOMAS.items()}  # "Inglés" -> "en"
-VOZ_VIDEO, VOZ_MUESTRA = "Voz original de cada video", "Muestra de voz propia"
+BANDERAS = {"en": "🇬🇧", "de": "🇩🇪", "ru": "🇷🇺"}
+OPC_IDIOMA = [f"{BANDERAS[k]} {v[3]}" for k, v in IDIOMAS.items()]           # "🇬🇧 Inglés"
+COD_DE = {f"{BANDERAS[k]} {v[3]}": k for k, v in IDIOMAS.items()}
+COD_DE.update({v[3]: k for k, v in IDIOMAS.items()})                        # tambien "Inglés" a secas
+VOZ_VIDEO, VOZ_MUESTRA = "🎬 La voz original de cada video", "🎤 Una muestra de voz propia"
 PASOS = {
-    1: ("paso1_preparar.py", "Paso 1 · Preparar (separar voz y transcribir)"),
-    2: ("paso2_traducir.py", "Paso 2 · Corregir y traducir (modelo local)"),
-    3: ("paso3_doblar.py", "Paso 3 · Doblar y armar los videos"),
+    1: ("paso1_preparar.py", "Preparar", "separa la voz y transcribe"),
+    2: ("paso2_traducir.py", "Traducir", "corrige y traduce con el modelo local"),
+    3: ("paso3_doblar.py", "Doblar", "voz clonada, mezcla y video final"),
 }
+PESO = {1: 0.3, 2: 0.2, 3: 0.5}
 
 _proc = None
-_detener = threading.Event()
 _ocupado = threading.Lock()
+RUN = {"activo": False, "pausado": False, "detener": False, "pasos": [], "inicio": 0.0, "pausa_acum": 0.0,
+       "pausa_desde": None, "prog": {}, "estado": "", "paso": None, "carpeta": "", "cod": "en", "msg": ""}
 
 
 # ---------------------------------------------------------------- ajustes
@@ -33,11 +41,17 @@ def cargar_ajustes():
         base = json.loads((APP_DIR / "config.json").read_text(encoding="utf-8"))
     except Exception:
         pass
-    aj = {"carpeta": base.get("carpeta_videos", ""), "idioma": "Inglés", "voz": VOZ_VIDEO, "contexto": ""}
+    aj = {"carpeta": os.path.expandvars(base.get("carpeta_videos", "")), "idioma": OPC_IDIOMA[0], "voz": VOZ_VIDEO,
+          "contexto": ""}
     try:
         aj.update(json.loads(AJUSTES_UI.read_text(encoding="utf-8")))
     except Exception:
         pass
+    if aj["idioma"] not in OPC_IDIOMA:
+        cod = COD_DE.get(aj["idioma"], "en")
+        aj["idioma"] = f"{BANDERAS[cod]} {IDIOMAS[cod][3]}"
+    if aj["voz"] not in (VOZ_VIDEO, VOZ_MUESTRA):
+        aj["voz"] = VOZ_MUESTRA if "muestra" in aj["voz"].lower() else VOZ_VIDEO
     return aj
 
 
@@ -48,7 +62,7 @@ def guardar_ajustes(**kw):
 
 
 def muestra_lista(carpeta):
-    d = Path(carpeta) / "_proceso" / "voz_muestra"
+    d = Path(carpeta or "") / "_proceso" / "voz_muestra"
     if (d / "ref.wav").exists() and (d / "info.json").exists():
         try:
             return json.loads((d / "info.json").read_text(encoding="utf-8")).get("archivo", "muestra")
@@ -58,15 +72,11 @@ def muestra_lista(carpeta):
 
 
 # ---------------------------------------------------------------- estado de la carpeta
-def tabla_estado(carpeta, idioma):
-    cod = NOMBRE_A_COD.get(idioma, "en")
-    suf = IDIOMAS[cod][2]
+def videos_de(carpeta, cod):
+    """Lista de videos con lo que ya esta hecho en disco: [{nombre, slug, hecho:{1,2,3: bool}, auto}]."""
     base = Path(carpeta or "")
     if not carpeta or not base.is_dir():
-        return [["—", "Elegí una carpeta con videos", "", "", ""]]
-    videos = sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in EXT_VIDEO)
-    if not videos:
-        return [["—", "No hay videos en esta carpeta", "", "", ""]]
+        return None
     proc, sal = base / "_proceso", base / "salida"
     por_video = {}
     if proc.is_dir():
@@ -75,21 +85,109 @@ def tabla_estado(carpeta, idioma):
                 por_video[json.loads((d / "es.json").read_text(encoding="utf-8"))["video"]] = d
             except Exception:
                 pass
-    filas = []
-    for v in videos:
+    suf = IDIOMAS[cod][2]
+    out = []
+    for v in sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in EXT_VIDEO):
         d = por_video.get(v.name, proc / slug_de(v.name))
-        prep = "✓" if (d / "es.json").exists() else "—"
-        trad = "—"
         t = d / f"{cod}.json"
+        auto = None
         if t.exists():
             try:
                 data = json.loads(t.read_text(encoding="utf-8"))
-                trad = "automática (a revisar)" if data.get("auto") and not data.get("curado") else "revisada ✓"
+                auto = bool(data.get("auto") and not data.get("curado"))
             except Exception:
-                trad = "?"
-        final = "✓" if (sal / f"{v.stem} [{suf}].mp4").exists() else "—"
-        filas.append([d.name, v.name, prep, trad, final])
-    return filas
+                pass
+        out.append({"nombre": v.stem, "slug": d.name,
+                    "hecho": {1: (d / "es.json").exists(), 2: t.exists(), 3: (sal / f"{v.stem} [{suf}].mp4").exists()},
+                    "auto": auto})
+    return out
+
+
+def _fmt_t(seg):
+    seg = int(max(0, seg))
+    h, m, s = seg // 3600, seg % 3600 // 60, seg % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _avance_video(v, pasos):
+    """% de un video para los pasos de esta corrida, y el paso/detalle en curso."""
+    tot, peso_t, actual = 0.0, 0.0, None
+    for p in pasos:
+        pct, det = RUN["prog"].get((v["slug"], p), (None, ""))
+        if pct is None:
+            pct = 100.0 if (v["hecho"][p] and RUN["estado"] != "corriendo") else 0.0
+        tot += PESO[p] * pct
+        peso_t += PESO[p]
+        if 0 < pct < 100 and actual is None:
+            actual = (p, pct, det)
+    return (tot / peso_t if peso_t else 0.0), actual
+
+
+def panel(carpeta, idioma):
+    cod = COD_DE.get(idioma, "en")
+    vids = videos_de(carpeta, cod)
+    if vids is None:
+        return ('<div class="vacio">📁 Elegí la carpeta donde están los videos para empezar.</div>')
+    if not vids:
+        return '<div class="vacio">No hay videos en esta carpeta (.mp4, .mov, .mkv…).</div>'
+
+    corriendo = RUN["estado"] in ("corriendo", "pausa") and RUN["carpeta"] == carpeta and RUN["cod"] == cod
+    pasos = RUN["pasos"] if corriendo or (RUN["estado"] and RUN["carpeta"] == carpeta) else [1, 2, 3]
+    partes = []
+
+    # cabecera general
+    if RUN["estado"] and RUN["carpeta"] == carpeta and RUN["cod"] == cod:
+        avs = [_avance_video(v, pasos)[0] for v in vids]
+        total = sum(avs) / len(avs) if avs else 0
+        if RUN["estado"] == "listo":
+            total = 100.0
+        activo = time.time() - RUN["inicio"] - RUN["pausa_acum"] - (
+            time.time() - RUN["pausa_desde"] if RUN["pausado"] and RUN["pausa_desde"] else 0)
+        eta = ""
+        if RUN["estado"] == "corriendo" and 2 <= total < 100:
+            eta = f" · faltan ~{_fmt_t(activo * (100 - total) / total)}"
+        chip = {"corriendo": ("chip-run", "En curso"), "pausa": ("chip-pausa", "En pausa"),
+                "listo": ("chip-ok", "Terminado"), "detenido": ("chip-pausa", "Detenido"),
+                "error": ("chip-err", "Con errores")}.get(RUN["estado"], ("chip-run", ""))
+        hecho_n = sum(1 for a in avs if a >= 99.9)
+        rayas = " rayas" if RUN["estado"] == "corriendo" else ""
+        msg = f'<div class="msg">{html.escape(RUN["msg"])}</div>' if RUN["msg"] else ""
+        partes.append(
+            f'<div class="general"><div class="fila"><span class="chip {chip[0]}">{chip[1]}</span>'
+            f'<span class="titulo-gen">{total:.0f}% · {hecho_n} de {len(vids)} videos</span>'
+            f'<span class="tiempo">⏱ {_fmt_t(activo)}{eta}</span></div>'
+            f'<div class="barra grande"><div class="relleno{rayas}" style="width:{total:.1f}%"></div></div>{msg}</div>')
+
+    # una tarjeta por video
+    for v in vids:
+        pct, actual = _avance_video(v, pasos)
+        chips = []
+        for p in (1, 2, 3):
+            pp, _ = RUN["prog"].get((v["slug"], p), (None, ""))
+            if pp is None:
+                pp = 100.0 if v["hecho"][p] else 0.0
+            if pp >= 99.9:
+                cls, txt = "ok", f"✓ {PASOS[p][1]}"
+            elif pp > 0:
+                cls, txt = "run", f"{PASOS[p][1]} {pp:.0f}%"
+            else:
+                cls, txt = "pend", PASOS[p][1]
+            if p == 2 and v["auto"] and pp >= 99.9:
+                txt += " · a revisar"
+            chips.append(f'<span class="paso {cls}">{txt}</span>')
+        det = ""
+        if actual and corriendo:
+            det = f'<div class="detalle">{"⏸ " if RUN["pausado"] else "⚙️ "}{html.escape(actual[2] or "")}</div>'
+        listo = all(v["hecho"].values()) and not actual
+        icono = "✅" if listo else ("🎞️" if not actual else "🔄")
+        rayas = " rayas" if (actual and corriendo and not RUN["pausado"]) else ""
+        partes.append(
+            f'<div class="video{" activo" if actual and corriendo else ""}"><div class="fila">'
+            f'<span class="nombre" title="{html.escape(v["nombre"])}">{icono} {html.escape(v["nombre"])}</span>'
+            f'<span class="pct">{pct:.0f}%</span></div>'
+            f'<div class="barra"><div class="relleno{rayas}" style="width:{pct:.1f}%"></div></div>'
+            f'<div class="pasos">{"".join(chips)}</div>{det}</div>')
+    return "".join(partes)
 
 
 # ---------------------------------------------------------------- acciones
@@ -104,16 +202,16 @@ def elegir_carpeta(actual):
         if p:
             return os.path.normpath(p)
         if r.returncode != 0:
-            gr.Warning("No pude abrir el selector de carpetas: pegá la ruta a mano en el cuadro.")
+            gr.Warning("No pude abrir el selector de carpetas: pegá la ruta en el cuadro.")
     except Exception:
-        gr.Warning("No pude abrir el selector de carpetas: pegá la ruta a mano en el cuadro.")
+        gr.Warning("No pude abrir el selector de carpetas: pegá la ruta en el cuadro.")
     return actual
 
 
 def abrir_salida(carpeta):
     p = Path(carpeta or "") / "salida"
     if not p.is_dir():
-        gr.Warning("Todavía no hay carpeta 'salida' (se crea en el Paso 3).")
+        gr.Warning("Todavía no hay videos terminados (la carpeta 'salida' se crea al doblar).")
         return
     try:
         os.startfile(str(p))  # Windows
@@ -121,23 +219,77 @@ def abrir_salida(carpeta):
         subprocess.Popen(["xdg-open", str(p)])
 
 
+def _suspender(pid, pausar):
+    try:
+        import psutil
+        procs = [psutil.Process(pid)]
+        procs += procs[0].children(recursive=True)
+        for q in procs:
+            try:
+                q.suspend() if pausar else q.resume()
+            except Exception:
+                pass
+        return
+    except ImportError:
+        pass
+    if os.name == "nt":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+        (ctypes.windll.ntdll.NtSuspendProcess if pausar else ctypes.windll.ntdll.NtResumeProcess)(h)
+        ctypes.windll.kernel32.CloseHandle(h)
+    else:
+        os.kill(pid, signal.SIGSTOP if pausar else signal.SIGCONT)
+
+
+def pausar_continuar():
+    p = _proc
+    if not RUN["activo"] or p is None or p.poll() is not None:
+        gr.Info("No hay nada corriendo para pausar.")
+        return gr.update(value="⏸ Pausar")
+    if not RUN["pausado"]:
+        _suspender(p.pid, True)
+        RUN.update(pausado=True, pausa_desde=time.time(), estado="pausa")
+        gr.Info("En pausa: la placa de video y el procesador quedan libres. La memoria sigue reservada; "
+                "si necesitás liberarla toda, usá Detener (después 'Hacer todo' sigue donde quedó).")
+        return gr.update(value="▶ Continuar", variant="primary")
+    _suspender(p.pid, False)
+    RUN["pausa_acum"] += time.time() - (RUN["pausa_desde"] or time.time())
+    RUN.update(pausado=False, pausa_desde=None, estado="corriendo")
+    return gr.update(value="⏸ Pausar", variant="secondary")
+
+
 def detener():
-    _detener.set()
+    RUN["detener"] = True
     p = _proc
     if p and p.poll() is None:
+        if RUN["pausado"]:
+            _suspender(p.pid, False)
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
         else:
             p.terminate()
-    return "Deteniendo..."
+    return gr.update(value="⏸ Pausar", variant="secondary")
 
 
 def _correr(script, args, salida):
-    """Corre un paso en un proceso aparte (asi la memoria de la GPU se libera al terminar)."""
+    """Corre un paso en un proceso aparte (al terminar se libera toda la memoria de la placa)."""
     global _proc
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     _proc = subprocess.Popen([sys.executable, script, *args], cwd=str(APP_DIR), env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+
+    def linea_lista(txt, por_cr):
+        if txt.startswith("@@P "):
+            try:
+                ev = json.loads(txt[4:])
+                RUN["prog"][(ev["cap"], ev["paso"])] = (float(ev["pct"]), ev.get("det", ""))
+            except Exception:
+                pass
+            return
+        if por_cr and salida and salida[-1].startswith("~"):
+            salida[-1] = "~" + txt  # barras de progreso de descargas: piso la linea anterior
+        else:
+            salida.append(("~" + txt) if por_cr else txt)
 
     def leer():
         buf = b""
@@ -146,21 +298,22 @@ def _correr(script, args, salida):
             if not ch:
                 break
             if ch in (b"\n", b"\r"):
-                linea = buf.decode("utf-8", "replace").rstrip()
+                txt = buf.decode("utf-8", "replace").rstrip()
                 buf = b""
-                if linea:
-                    if ch == b"\r" and salida and salida[-1].startswith("~"):
-                        salida[-1] = "~" + linea  # barras de progreso: piso la linea anterior
-                    else:
-                        salida.append(("~" + linea) if ch == b"\r" else linea)
+                if txt:
+                    linea_lista(txt, ch == b"\r")
             else:
                 buf += ch
         if buf:
-            salida.append(buf.decode("utf-8", "replace"))
+            linea_lista(buf.decode("utf-8", "replace").rstrip(), False)
 
     t = threading.Thread(target=leer, daemon=True)
     t.start()
     return t
+
+
+def _registro(salida):
+    return "\n".join(l.lstrip("~") for l in salida)
 
 
 def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar):
@@ -168,121 +321,197 @@ def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar):
     if not carpeta or not Path(carpeta).is_dir():
         raise gr.Error("Elegí primero la carpeta donde están los videos.")
     if not any(p.suffix.lower() in EXT_VIDEO for p in Path(carpeta).iterdir() if p.is_file()):
-        raise gr.Error("En esa carpeta no hay videos (.mp4, .mov, .mkv...).")
+        raise gr.Error("En esa carpeta no hay videos (.mp4, .mov, .mkv…).")
+    cod = COD_DE.get(idioma, "en")
+    lista = list(pasos)
+    if voz == VOZ_MUESTRA and 3 in lista and not archivo_voz and not muestra_lista(carpeta):
+        raise gr.Error("Elegiste usar una muestra de voz propia: subí un audio o video con la voz (10-30 s).")
     if not _ocupado.acquire(blocking=False):
-        raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine o tocá Detener.")
-    _detener.clear()
+        raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine, o tocá Detener.")
+    salida = deque(maxlen=500)
     try:
-        cod = NOMBRE_A_COD.get(idioma, "en")
         guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, contexto=contexto or "")
         proc = Path(carpeta) / "_proceso"
         proc.mkdir(parents=True, exist_ok=True)
         ajustes = {"carpeta_videos": carpeta, "idioma_codigo": cod}
         if (contexto or "").strip():
             ajustes["contexto"] = contexto.strip()
-        lista = list(pasos)
         if voz == VOZ_MUESTRA and 3 in lista:
             if archivo_voz:
                 lista.insert(lista.index(3), "voz")
-            elif not muestra_lista(carpeta):
-                raise gr.Error("Elegiste 'Muestra de voz propia': subí un audio o video con la voz (10-30 s).")
             ajustes["voz_muestra"] = str(proc / "voz_muestra")
         aj_path = proc / "ajustes_ui.json"
         aj_path.write_text(json.dumps(ajustes, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        salida = deque(maxlen=400)
+        RUN.update(activo=True, pausado=False, detener=False, pasos=[p for p in lista if p != "voz"],
+                   inicio=time.time(), pausa_acum=0.0, pausa_desde=None, prog={}, estado="corriendo",
+                   carpeta=carpeta, cod=cod, msg="")
         for paso in lista:
-            if _detener.is_set():
+            if RUN["detener"]:
                 break
             if paso == "voz":
-                script, titulo, extra = "voz_muestra.py", "Preparando la muestra de voz", [f"--archivo={archivo_voz}"]
+                script, titulo, extra = "voz_muestra.py", "Muestra de voz", [f"--archivo={archivo_voz}"]
+                RUN["msg"] = "Preparando la muestra de voz…"
             else:
-                script, titulo = PASOS[paso]
+                script, titulo, _ = PASOS[paso]
                 extra = ["--forzar"] if (forzar and paso == 2) else []
+                RUN["msg"] = f"Paso {paso} de 3 · {PASOS[paso][1]}: {PASOS[paso][2]}"
             if os.environ.get("DOBLAJE_SIMULAR"):
                 extra.append("--simular")  # solo para pruebas
+            RUN["paso"] = paso
             salida.append("")
-            salida.append(f"=== {titulo} ===")
+            salida.append(f"=== {RUN['msg']} ===")
             hilo = _correr(script, [f"--config={aj_path}", *extra], salida)
             while hilo.is_alive() or _proc.poll() is None:
-                yield "\n".join(l.lstrip("~") for l in salida), tabla_estado(carpeta, idioma)
+                yield panel(carpeta, idioma), _registro(salida), gr.update()
                 time.sleep(1.0)
             hilo.join(timeout=2)
             codigo = _proc.returncode
-            if _detener.is_set():
+            if RUN["detener"]:
+                RUN.update(estado="detenido", msg="Detenido. Tocá 'Hacer todo' para seguir desde donde quedó.")
                 salida.append("=== Detenido ===")
                 break
             if codigo != 0:
-                salida.append(f"=== {titulo}: terminó con errores (código {codigo}). Detalle arriba y en "
-                              f"_proceso/log.txt ===")
+                RUN.update(estado="error", msg=f"El paso «{titulo}» terminó con errores. El detalle está abajo "
+                                                f"y en _proceso/log.txt.")
+                salida.append(f"=== {titulo}: terminó con errores (código {codigo}) ===")
                 break
         else:
-            salida.append("")
-            salida.append("=== Listo ===" + (" Los videos están en la carpeta 'salida'." if 3 in lista else ""))
-        yield "\n".join(l.lstrip("~") for l in salida), tabla_estado(carpeta, idioma)
+            RUN.update(estado="listo", msg="¡Listo! Los videos están en la carpeta 'salida'." if 3 in lista
+                       else "Listo.")
+            salida.append("=== Listo ===")
+        RUN.update(activo=False, pausado=False)
+        yield panel(carpeta, idioma), _registro(salida), gr.update(value="⏸ Pausar", variant="secondary")
     finally:
+        RUN["activo"] = False
         _ocupado.release()
 
 
 # ---------------------------------------------------------------- interfaz
+CSS = """
+.gradio-container {max-width: 1280px !important; margin: auto;}
+#hero {padding: 26px 30px; border-radius: 20px; margin-bottom: 6px; color: white;
+       background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #db2777 100%);
+       box-shadow: 0 10px 30px rgba(79,70,229,.25);}
+#hero h1 {margin: 0; font-size: 30px; font-weight: 800; letter-spacing: -.5px; color: white;}
+#hero p {margin: 6px 0 0; opacity: .92; font-size: 15px; color: white;}
+.tarjeta {border-radius: 18px !important; padding: 18px !important; box-shadow: 0 4px 18px rgba(15,23,42,.06);
+          border: 1px solid rgba(100,116,139,.15) !important;}
+.seccion {font-weight: 700; font-size: 15px; margin: 2px 0 -4px; opacity: .85;}
+#btn-todo {font-size: 18px !important; padding: 14px !important; border-radius: 14px !important;
+           background: linear-gradient(90deg, #4f46e5, #7c3aed) !important; color: white !important; border: none !important;}
+.vacio {padding: 40px 20px; text-align: center; opacity: .7; font-size: 15px;}
+.general {padding: 16px 18px; border-radius: 16px; margin-bottom: 14px;
+          background: linear-gradient(135deg, rgba(79,70,229,.08), rgba(219,39,119,.06));
+          border: 1px solid rgba(79,70,229,.18);}
+.general .msg {margin-top: 8px; font-size: 13px; opacity: .8;}
+.fila {display: flex; align-items: center; gap: 10px;}
+.titulo-gen {font-weight: 700; font-size: 16px;}
+.tiempo {margin-left: auto; font-size: 13px; opacity: .75; white-space: nowrap;}
+.chip {font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; color: white;}
+.chip-run {background: #4f46e5;} .chip-pausa {background: #f59e0b;} .chip-ok {background: #16a34a;}
+.chip-err {background: #dc2626;}
+.barra {height: 9px; border-radius: 999px; background: rgba(100,116,139,.18); overflow: hidden; margin-top: 8px;}
+.barra.grande {height: 14px;}
+.relleno {height: 100%; border-radius: 999px; background: linear-gradient(90deg, #6366f1, #a855f7, #22c55e);
+          transition: width .8s ease;}
+.relleno.rayas {background-image: linear-gradient(45deg, rgba(255,255,255,.25) 25%, transparent 25%,
+          transparent 50%, rgba(255,255,255,.25) 50%, rgba(255,255,255,.25) 75%, transparent 75%),
+          linear-gradient(90deg, #6366f1, #a855f7); background-size: 22px 22px, 100% 100%;
+          animation: correr 1s linear infinite;}
+@keyframes correr {from {background-position: 0 0, 0 0;} to {background-position: 22px 0, 0 0;}}
+.video {padding: 12px 14px; border-radius: 14px; margin-bottom: 10px; border: 1px solid rgba(100,116,139,.18);}
+.video.activo {border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.15);}
+.nombre {font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;}
+.pct {font-weight: 700; font-size: 14px; color: #6366f1;}
+.pasos {display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;}
+.paso {font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid rgba(100,116,139,.25);}
+.paso.ok {background: rgba(22,163,74,.12); color: #15803d; border-color: rgba(22,163,74,.3);}
+.paso.run {background: rgba(99,102,241,.12); color: #4f46e5; border-color: rgba(99,102,241,.35); font-weight: 600;}
+.paso.pend {opacity: .55;}
+.detalle {margin-top: 6px; font-size: 13px; opacity: .8;}
+#panel {max-height: 640px; overflow-y: auto; padding-right: 4px;}
+footer {display: none !important;}
+#btn-stop {color: #dc2626 !important;}
+#pasos-sueltos {flex-wrap: nowrap !important;}
+#pasos-sueltos button {opacity: .85;}
+"""
+
+
 def armar():
     aj = cargar_ajustes()
-    with gr.Blocks(title="Doblaje Gregorio") as demo:
-        gr.Markdown("## Doblaje automático\nTraduce y dobla los videos de una carpeta con voz clonada y subtítulos "
-                    "en castellano. Todo corre en tu compu, sin API key. Después lo podemos curar con Claude.")
-        with gr.Row():
-            carpeta = gr.Textbox(label="Carpeta con los videos", value=aj["carpeta"], scale=5)
-            b_elegir = gr.Button("📁 Elegir…", scale=1, min_width=120)
-        with gr.Row():
-            idioma = gr.Radio(list(NOMBRE_A_COD), value=aj["idioma"], label="Traducir y doblar al")
-            voz = gr.Radio([VOZ_VIDEO, VOZ_MUESTRA], value=aj["voz"], label="Voz")
-        archivo_voz = gr.File(label="Muestra de voz (audio o video, 10-30 s de una sola persona, sin música)",
-                              file_types=["audio", "video"], type="filepath", visible=aj["voz"] == VOZ_MUESTRA)
-        info_voz = gr.Markdown(visible=aj["voz"] == VOZ_MUESTRA)
-        with gr.Accordion("Opciones", open=False):
-            contexto = gr.Textbox(label="Sobre el video (ayuda a traducir mejor: quién habla y de qué)",
-                                  value=aj.get("contexto", ""), lines=2,
-                                  placeholder="Si lo dejás vacío: el Dr. Gregorio Dunayevich, psicólogo, sobre arte, "
-                                              "rock, genios, drogas y suicidio.")
-            forzar = gr.Checkbox(label="Rehacer las traducciones automáticas (las revisadas no se tocan)", value=False)
-        with gr.Row():
-            b_todo = gr.Button("▶ Hacer todo (1 → 2 → 3)", variant="primary", scale=3)
-            b1 = gr.Button("1 · Preparar")
-            b2 = gr.Button("2 · Traducir")
-            b3 = gr.Button("3 · Doblar")
-        with gr.Row():
-            b_stop = gr.Button("⏹ Detener", variant="stop")
-            b_salida = gr.Button("📂 Abrir carpeta de salida")
-            b_ref = gr.Button("🔄 Actualizar estado")
-        estado = gr.Dataframe(headers=["Capítulo", "Video", "Preparado", "Traducción", "Video final"],
-                              value=tabla_estado(aj["carpeta"], aj["idioma"]), interactive=False, wrap=True)
-        registro = gr.Textbox(label="Progreso", lines=18, max_lines=18, autoscroll=True, interactive=False)
+    with gr.Blocks(title="Doblaje con voz clonada") as demo:
+        gr.HTML('<div id="hero"><h1>🎙️ Doblaje con voz clonada</h1>'
+                '<p>Traducí y doblá tus videos al inglés, alemán o ruso, con subtítulos en castellano. '
+                'Todo corre en tu compu, sin API key.</p></div>')
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=5, elem_classes="tarjeta"):
+                gr.HTML('<div class="seccion">1 · Carpeta con los videos</div>')
+                with gr.Row():
+                    carpeta = gr.Textbox(value=aj["carpeta"], show_label=False, scale=5,
+                                         placeholder="C:\\Users\\...\\Desktop\\mis videos")
+                    b_elegir = gr.Button("📁 Elegir", scale=1, min_width=110)
+                gr.HTML('<div class="seccion">2 · Idioma del doblaje</div>')
+                idioma = gr.Radio(OPC_IDIOMA, value=aj["idioma"], show_label=False)
+                gr.HTML('<div class="seccion">3 · Voz</div>')
+                voz = gr.Radio([VOZ_VIDEO, VOZ_MUESTRA], value=aj["voz"], show_label=False)
+                archivo_voz = gr.File(label="Muestra de voz: 10-30 s de una sola persona hablando, sin música",
+                                      file_types=["audio", "video"], type="filepath",
+                                      visible=aj["voz"] == VOZ_MUESTRA, height=110)
+                info_voz = gr.Markdown(visible=aj["voz"] == VOZ_MUESTRA)
+                with gr.Accordion("⚙️ Opciones avanzadas", open=False):
+                    contexto = gr.Textbox(label="Sobre el video (ayuda a traducir mejor: quién habla y de qué)",
+                                          value=aj.get("contexto", ""), lines=2,
+                                          placeholder="Vacío = el Dr. Gregorio Dunayevich, psicólogo, sobre arte, "
+                                                      "rock, genios, drogas y suicidio.")
+                    forzar = gr.Checkbox(label="Rehacer las traducciones automáticas (las revisadas no se tocan)",
+                                         value=False)
+                b_todo = gr.Button("▶  Hacer todo", elem_id="btn-todo")
+                with gr.Row(elem_id="pasos-sueltos"):
+                    b1 = gr.Button("1 · Preparar", size="sm", min_width=60)
+                    b2 = gr.Button("2 · Traducir", size="sm", min_width=60)
+                    b3 = gr.Button("3 · Doblar", size="sm", min_width=60)
+                with gr.Row():
+                    b_pausa = gr.Button("⏸ Pausar", variant="secondary")
+                    b_stop = gr.Button("⏹ Detener", variant="stop", elem_id="btn-stop")
+                b_salida = gr.Button("📂 Abrir los videos terminados", variant="secondary")
+            with gr.Column(scale=7, elem_classes="tarjeta"):
+                with gr.Row():
+                    gr.HTML('<div class="seccion">Progreso</div>')
+                    b_ref = gr.Button("🔄", size="sm", min_width=50, scale=0)
+                tablero = gr.HTML(panel(aj["carpeta"], aj["idioma"]), elem_id="panel")
+                with gr.Accordion("🧾 Detalle técnico", open=False):
+                    registro = gr.Textbox(show_label=False, lines=16, max_lines=16, autoscroll=True,
+                                          interactive=False)
 
         def ver_voz(v, c):
             m = muestra_lista(c)
-            txt = f"Muestra ya preparada en esta carpeta: **{m}** (subí otra para cambiarla)." if m else \
-                "Todavía no hay muestra en esta carpeta."
+            txt = (f"✔️ Ya hay una muestra preparada en esta carpeta: **{m}**. Subí otra para cambiarla."
+                   if m else "Todavía no hay una muestra en esta carpeta.")
             return gr.update(visible=v == VOZ_MUESTRA), gr.update(visible=v == VOZ_MUESTRA, value=txt)
 
         voz.change(ver_voz, [voz, carpeta], [archivo_voz, info_voz])
-        b_elegir.click(elegir_carpeta, carpeta, carpeta).then(tabla_estado, [carpeta, idioma], estado) \
+        b_elegir.click(elegir_carpeta, carpeta, carpeta).then(panel, [carpeta, idioma], tablero) \
             .then(ver_voz, [voz, carpeta], [archivo_voz, info_voz])
-        carpeta.submit(tabla_estado, [carpeta, idioma], estado)
-        idioma.change(tabla_estado, [carpeta, idioma], estado)
-        b_ref.click(tabla_estado, [carpeta, idioma], estado)
-        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar]
+        carpeta.submit(panel, [carpeta, idioma], tablero)
+        carpeta.blur(panel, [carpeta, idioma], tablero)
+        idioma.change(panel, [carpeta, idioma], tablero)
+        b_ref.click(panel, [carpeta, idioma], tablero)
+
         def hacer(pasos):
             def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_):
                 yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_)
             return correr_pasos
 
+        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar]
         for boton, pasos in ((b_todo, (1, 2, 3)), (b1, (1,)), (b2, (2,)), (b3, (3,))):
-            boton.click(hacer(pasos), entradas, [registro, estado])
-        b_stop.click(detener, None, registro)
-        b_salida.click(abrir_salida, carpeta, None)
+            boton.click(hacer(pasos), entradas, [tablero, registro, b_pausa])
+        b_pausa.click(pausar_continuar, None, b_pausa, concurrency_limit=None, queue=False)
+        b_stop.click(detener, None, b_pausa, concurrency_limit=None, queue=False)
+        b_salida.click(abrir_salida, carpeta, None, queue=False)
     return demo
 
 
 if __name__ == "__main__":
-    armar().queue(default_concurrency_limit=2).launch(server_name="127.0.0.1", inbrowser=False,
-                                                      theme=gr.themes.Soft())
+    tema = gr.themes.Soft(primary_hue="indigo", secondary_hue="purple", neutral_hue="slate", radius_size="lg")
+    armar().queue(default_concurrency_limit=2).launch(server_name="127.0.0.1", inbrowser=False, theme=tema, css=CSS)

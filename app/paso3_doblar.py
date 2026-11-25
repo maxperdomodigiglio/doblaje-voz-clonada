@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from comun import (archivo_traduccion, carpeta_idioma, referencia_voz, APP_DIR, carpeta_proceso, carpeta_salida, correr, ejecutar_principal, escribir_json,
+from comun import (progreso, archivo_traduccion, carpeta_idioma, referencia_voz, APP_DIR, carpeta_proceso, carpeta_salida, correr, ejecutar_principal, escribir_json,
                    escribir_srt, ffmpeg, ffmpeg_exe, leer_json, log, log_error, texto_a_cues, wer)
 
 SR = 44100
@@ -313,7 +313,7 @@ def palabra_extra_inicial(texto, oido, ref_txt):
     return (rf and oi[0] == rf[-1]) or (len(oi) > 1 and oi[1] == tx[0])
 
 
-def generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt):
+def generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt, avance=None):
     import librosa
     import soundfile as sf
 
@@ -325,6 +325,8 @@ def generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt):
     prompt_xv = None
     intentos_max = int(cfg.get("intentos_max", 3))
     for i, b in enumerate(bloques):
+        if avance:
+            avance(i, len(bloques))
         texto = (b.get("tts") or b["en"]).strip()
         h = hashlib.md5((texto + ref_hash + cfg.get("modo_clon", "icl") + str(SIMULAR)).encode()).hexdigest()[:12]
         wav_p, meta_p = tts_dir / f"b{b['id']:03d}.wav", tts_dir / f"b{b['id']:03d}.json"
@@ -671,6 +673,7 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
     segs = plan_ajuste(bloques, [len(c) / SR for c in clips], dur_total, fondo.mean(1), fps, cfg)
     total = segs[-1]["T"] + segs[-1]["n"]
     N = int(round(total * SR))
+    progreso(d.name, 3, 82, "mezclando la voz con la música")
     log(f"  Video ajustado al {cfg.get('idioma_nombre', 'ingles')}: {dur_total:.0f}s -> {total:.0f}s "
         f"(velocidad media {dur_total / total:.2f}x, max {max(sg['f'] for sg in segs):.2f}x)")
 
@@ -742,11 +745,13 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
     escribir_srt(srt_en, cues_en)
 
     log("  Armando video final (re-codificando la imagen)...")
+    progreso(d.name, 3, 88, "armando el video")
     video_ajustado(video, segs, w / "mezcla.wav", srt_es_aj, out_mp4, fps)
     (sal / f"{stem} [ES].srt").write_bytes(srt_es_aj.read_bytes())
     (sal / f"{stem} [{SUFIJO}].srt").write_bytes(srt_en.read_bytes())
     if cfg.get("quemar_subtitulos"):
         try:
+            progreso(d.name, 3, 95, "grabando los subtítulos en la imagen")
             arriba = [(mapear(a, segs), mapear(z, segs)) for a, z in detectar_zocalos(video, d)]
             quemar_subtitulos(out_mp4, w / "mezcla.wav", srt_es_aj, quemado, w, arriba=arriba)
         except Exception:
@@ -801,14 +806,19 @@ def doblar(d, cfg, motor):
                 log_error("grabar subtitulos")
         else:
             log(f"[{d.name}] ya doblado y sin cambios, salteo")
+        progreso(d.name, 3, 100, "ya estaba doblado")
         return
     log(f"[{d.name}] DOBLANDO: {video.name}")
     bloques = en["bloques"]
 
-    clips, informe = generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt)
+    progreso(d.name, 3, 1, "cargando la voz")
+    clips, informe = generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt,
+                                     avance=lambda i, n: progreso(d.name, 3, 2 + 78 * i / max(n, 1),
+                                                                  f"generando la voz: frase {i + 1} de {n}"))
     if cfg.get("ajustar_video"):
         doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp4, quemado, srt_es, sal, stem)
         _anotar_voz(w, ref_hash)
+        progreso(d.name, 3, 100, "listo")
         return
 
     voz_orig, _ = sf.read(str(d / "voz.flac"), dtype="float32")
@@ -893,6 +903,7 @@ def doblar(d, cfg, motor):
     log(f"[{d.name}] LISTO -> {out_mp4.name} | bloques a revisar: {[x['id'] for x in flojos] or 'ninguno'}"
         f" | acelerados: {len(acelerados)} | desfasados: {len(desfasados)}")
     _anotar_voz(w, ref_hash)
+    progreso(d.name, 3, 100, "listo")
 
 
 def main(cfg):

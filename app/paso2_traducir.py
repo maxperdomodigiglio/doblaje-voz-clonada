@@ -11,12 +11,13 @@ Nunca pisa una traduccion revisada a mano (las que no tienen "auto": true o tien
 Con --forzar rehace las automaticas.
 """
 import difflib
+import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 
-from comun import (APP_DIR, archivo_traduccion, carpeta_proceso, ejecutar_principal, escribir_json, escribir_srt,
+from comun import (APP_DIR, progreso, archivo_traduccion, carpeta_proceso, ejecutar_principal, escribir_json, escribir_srt,
                    leer_json, log, log_error, normalizar_palabras)
 from textos import bloques_por_oraciones, corregir_segmentos, cues_desde_palabras, palabras_limpias
 
@@ -108,7 +109,7 @@ def _valida(orig, nuevo):
     return difflib.SequenceMatcher(None, " ".join(a), " ".join(b)).ratio() >= 0.75
 
 
-def corregir_castellano(es, llm, glos):
+def corregir_castellano(es, llm, glos, avance=None):
     segs = es["segmentos"]
     textos = [aplicar_glosario_es(sg["text"], glos) for sg in segs]
     final = list(textos)
@@ -116,6 +117,8 @@ def corregir_castellano(es, llm, glos):
     nombres = ", ".join(glos.get("nombres", []))
     tanda = int(llm.cfg.get("correccion_tanda", 10))
     for i in range(0, len(segs), tanda):
+        if avance:
+            avance(i, len(segs))
         grupo = textos[i:i + tanda]
         ctx = "\n".join(final[max(0, i - 3):i])
         usuario = (f"Nombres que aparecen en la serie: {nombres}.\n\n"
@@ -198,11 +201,24 @@ def _limpiar(tr, cfg):
     return " ".join(tr.split())
 
 
-def traducir_bloques(bloques, llm, cfg, ref_en=None):
+def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None):
+    """parcial: archivo donde se guarda cada bloque traducido, para retomar si se corta o se detiene."""
     sis = sistema_traduccion(cfg)
     L = cfg["idioma_destino"]
     hechos, avisos = [], []
+    cache = {}
+    if parcial and parcial.exists():
+        try:
+            cache = json.loads(parcial.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
     for i, (s, e, txt) in enumerate(bloques):
+        if avance:
+            avance(i, len(bloques))
+        clave = hashlib.md5(f"{cfg['idioma_codigo']}|{txt}|{ref_en[i] if ref_en else ''}".encode()).hexdigest()[:16]
+        if clave in cache:
+            hechos.append({"es": txt, "tr": cache[clave]})
+            continue
         previos = hechos[-2:]
         ctx = "".join(f"ES: {b['es']}\n{L}: {b['tr']}\n" for b in previos)
         sig = bloques[i + 1][2] if i + 1 < len(bloques) else ""
@@ -224,6 +240,9 @@ def traducir_bloques(bloques, llm, cfg, ref_en=None):
         if problema:
             avisos.append((i + 1, s, problema, txt, tr))
         hechos.append({"es": txt, "tr": tr or txt})
+        if parcial and tr and not problema:
+            cache[clave] = tr
+            parcial.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
         log(f"  bloque {i + 1:3d}/{len(bloques)}  {tr[:70]}")
     return [b["tr"] for b in hechos], avisos
 
@@ -258,14 +277,14 @@ def texto_para_voz(txt, cod, glos):
 
 
 # ---------------------------------------------------------------- por capitulo
-def es_corregido(d, es, llm, glos):
+def es_corregido(d, es, llm, glos, avance=None):
     p = d / "es_corregido.json"
     if p.exists() and not FORZAR:
         prev = leer_json(p)
         if prev.get("version") == VERSION_CORR and p.stat().st_mtime >= (d / "es.json").stat().st_mtime:
             return prev
     log(f"[{d.name}] Corrigiendo la transcripcion en castellano...")
-    segs, cambios, rechazados = corregir_castellano(es, llm, glos)
+    segs, cambios, rechazados = corregir_castellano(es, llm, glos, avance)
     data = {"version": VERSION_CORR, "segmentos": segs,
             "cambios": [{"t": round(t, 2), "antes": a, "despues": b} for t, a, b in cambios],
             "rechazados": [{"t": round(t, 2), "antes": a, "propuesta": b} for t, a, b in rechazados]}
@@ -281,10 +300,21 @@ def traducir_capitulo(d, cfg, llm, glos):
         prev = leer_json(destino)
         if not prev.get("auto") or prev.get("curado"):
             log(f"[{d.name}] traduccion al {cfg['idioma_nombre']} ya revisada, no la toco")
+            progreso(d.name, 2, 100, "traducción ya revisada")
             return
         if not FORZAR:
             log(f"[{d.name}] ya traducido al {cfg['idioma_nombre']} (automatico), salteo")
+            progreso(d.name, 2, 100, "ya estaba traducido")
             return
+
+    progreso(d.name, 2, 1, "cargando el traductor")
+    parcial = d / f"_parcial_{cfg['idioma_codigo']}.json"
+
+    def av_corr(i, n):
+        progreso(d.name, 2, 2 + 28 * i / max(n, 1), "corrigiendo la transcripción")
+
+    def av_trad(i, n, base=30):
+        progreso(d.name, 2, base + (98 - base) * i / max(n, 1), f"traduciendo frase {i + 1} de {n}")
 
     # si ya hay una version en ingles revisada, se usan sus mismos bloques y sirve de referencia
     en_rev = None
@@ -297,9 +327,10 @@ def traducir_capitulo(d, cfg, llm, glos):
         bloques = [(b["start"], b["end"], b["es"]) for b in en_rev]
         log(f"[{d.name}] Traduciendo {len(bloques)} bloques al {cfg['idioma_nombre']} "
             f"(con la version en ingles revisada de referencia)...")
-        trads, avisos = traducir_bloques(bloques, llm, cfg, ref_en=[b["en"] for b in en_rev])
+        trads, avisos = traducir_bloques(bloques, llm, cfg, ref_en=[b["en"] for b in en_rev],
+                                         avance=lambda i, n: av_trad(i, n, base=3), parcial=parcial)
     else:
-        corr = es_corregido(d, es, llm, glos)
+        corr = es_corregido(d, es, llm, glos, av_corr)
         segs = corr["segmentos"]
         if not (d / "es.srt").exists():
             cues = cues_desde_palabras(segs)
@@ -308,7 +339,7 @@ def traducir_capitulo(d, cfg, llm, glos):
         ws = palabras_limpias({"segmentos": segs})
         bloques = bloques_por_oraciones(ws, max_dur=float(cfg.get("bloque_max_seg", 14.0)) - 1.0)
         log(f"[{d.name}] Traduciendo {len(bloques)} bloques al {cfg['idioma_nombre']}...")
-        trads, avisos = traducir_bloques(bloques, llm, cfg)
+        trads, avisos = traducir_bloques(bloques, llm, cfg, avance=av_trad, parcial=parcial)
 
     cod = cfg["idioma_codigo"]
     salida = []
@@ -321,6 +352,8 @@ def traducir_capitulo(d, cfg, llm, glos):
     escribir_json(destino, {"slug": d.name, "video": es["video"], "idioma": cod, "auto": True,
                             "modelo": cfg.get("modelo_traduccion", "Qwen/Qwen3-4B-Instruct-2507"), "bloques": salida})
     escribir_revision(d, cfg, es, corr, avisos)
+    parcial.unlink(missing_ok=True)
+    progreso(d.name, 2, 100, "listo")
     log(f"[{d.name}] LISTO paso 2 -> {destino.name} ({len(salida)} bloques, {len(avisos)} para revisar)")
 
 
