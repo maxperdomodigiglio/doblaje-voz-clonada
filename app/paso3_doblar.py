@@ -557,7 +557,7 @@ def ensamblar(bloques, clips, voz_orig, dur_total, cfg):
 
 # ---------------------------------------------------------------- modo "ajustar video": el audio manda, el video se acelera
 # ---------------------------------------------------------------- partes cantadas
-VERSION_CANTO = 2  # 2: varias versiones por trozo, se elige la mejor, afinacion y sonido de voz
+VERSION_CANTO = 3  # 3: conversor de voz cantada: la voz cae en las notas exactas del original
 
 
 def cargar_cantos(d, cfg):
@@ -589,17 +589,94 @@ def _ref_canto(voz, tr, wc, i):
     return ref, mejor["orig"]
 
 
+def _ref_cantante(voz, tr, wc, i, max_s=15.0):
+    """Timbre del cantante original para el conversor: sus lineas con mas voz, pegadas (hasta 15 s; mas largo
+    achica la ventana de trabajo del conversor)."""
+    import soundfile as sf
+    lineas = [ln for tz in tr["trozos"] for ln in tz["lineas"]] or [{"t0": tr["t0"], "t1": tr["t1"]}]
+    orden = sorted(lineas, key=lambda ln: -rms_activo(voz[int(ln["t0"] * SR):int(ln["t1"] * SR)]))
+    elegidas, total = [], 0.0
+    for ln in orden:
+        dur = min(ln["t1"] - ln["t0"], max_s - total)
+        if dur < 1.0:
+            continue
+        elegidas.append((ln["t0"], ln["t0"] + dur))
+        total += dur
+        if total >= max_s - 1.0:
+            break
+    partes = []
+    for a, b in sorted(elegidas):
+        partes += [voz[int(a * SR):int(b * SR)], np.zeros(int(0.08 * SR), np.float32)]
+    y = np.concatenate(partes) if partes else voz[int(tr["t0"] * SR):int(min(tr["t1"], tr["t0"] + max_s) * SR)]
+    ref = wc / f"timbre_{i}.wav"
+    sf.write(str(ref), y, SR)
+    return ref
+
+
+def _timbre_muestra(cfg, ref_wav, wc, max_s=15.0):
+    """Timbre de la muestra de voz subida, para el conversor: hasta 15 s de voz limpia, sin silencios."""
+    import soundfile as sf
+    base = Path(cfg["voz_muestra"]) / "voz.flac"
+    origen = base if base.exists() else Path(ref_wav)
+    y, sr = sf.read(str(origen), dtype="float32")
+    if y.ndim > 1:
+        y = y.mean(1)
+    if sr != SR:
+        import librosa
+        y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+    act = _actividad(y, relativo=35.0)
+    hop = int(0.01 * SR)
+    partes, total, i = [], 0, 0
+    while i < len(act) and total < max_s * SR:
+        if act[i]:
+            j = i
+            while j < len(act) and (act[j] or (j + 25 < len(act) and act[j:j + 25].any())):
+                j += 1
+            seg = y[max(0, i * hop - hop * 3):min(len(y), j * hop + hop * 3)]
+            if len(seg) > 0.4 * SR:
+                partes.append(seg[:int(max_s * SR) - total])
+                total += len(partes[-1])
+            i = j
+        else:
+            i += 1
+    out = wc / "timbre_muestra.wav"
+    sf.write(str(out), np.concatenate(partes) if partes else y[:int(max_s * SR)], SR)
+    return out
+
+
+def _leer_mono(p):
+    import soundfile as sf
+    y, sr_y = sf.read(str(p), dtype="float32")
+    if y.ndim > 1:
+        y = y.mean(1)
+    if sr_y != SR:
+        import librosa
+        y = librosa.resample(y, orig_sr=sr_y, target_sr=SR)
+    return y
+
+
+def _md5(p):
+    return hashlib.md5(Path(p).read_bytes()).hexdigest()[:10]
+
+
 def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
-    """Canta cada trozo traducido con YingMusic-Singer (en su entorno), elige la mejor de varias versiones
-    (la que mejor se entiende y mas afinada), la afina a la melodia original y le da sonido de voz cantada.
-    Devuelve [{"t0", "t1", "voz", "accion"}]; lo que no se pudo cantar queda con la voz original."""
+    """Partes cantadas. El canto manda: la voz tiene que caer en las notas de la cancion, no al reves.
+
+    - Misma letra (el tramo ya esta en el idioma de destino) y voz de una muestra: el conversor de voz cantada
+      (YingMusic-SVC) lleva la voz original al timbre de la muestra. Notas, ritmo, vibrato y expresion son los
+      del cantante: solo cambia quien canta.
+    - Letra traducida: YingMusic-Singer la canta con el timbre del cantante original (una muestra hablada como
+      referencia la hacia sonar recitada), se elige la mejor de varias versiones y el conversor la hace caer en
+      las notas exactas de la melodia original, con el timbre de la muestra si la hay. Lo que queda del tramo
+      entre trozos (respiraciones, coros sin letra) tambien pasa por el conversor.
+    Sin el conversor instalado se hace como antes (afinacion con WORLD).
+    Devuelve [{"t0", "t1", "voz", "accion", ...}]; lo que no se pudo queda con la voz original."""
     import soundfile as sf
 
-    from canto import REPO, afinar, correr_motor, desafinacion, huella, motor_instalado, sonido_voz
+    from canto import (REPO, REPO_SVC, afinar, conversor_instalado, correr_motor, desafinacion, huella,
+                       motor_instalado, sonido_voz)
 
-    voz, sr_v = sf.read(str(d / "voz.flac"), dtype="float32")
-    if voz.ndim > 1:
-        voz = voz.mean(1)
+    voz = _leer_mono(d / "voz.flac")
     wc = w / "canto"
     wc.mkdir(parents=True, exist_ok=True)
     idx_p = wc / "indice.json"
@@ -608,24 +685,61 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
     nfe = int(cfg.get("canto_pasos", 32))
     n_cand = max(1, int(cfg.get("canto_versiones", 3)))
     afina = bool(cfg.get("canto_afinar", True))
+    muestra = bool(cfg.get("voz_muestra"))
     proc_h = (afina, float(cfg.get("canto_sala", 0.12)), float(cfg.get("canto_afinar_umbral", 15)))
     hay_motor = SIMULAR or motor_instalado()
-    if not hay_motor and any(t["accion"] == "cantar" for t in tramos):
+    hay_svc = bool(cfg.get("canto_conversor", True)) and (SIMULAR or conversor_instalado())
+    pasos_svc = int(cfg.get("canto_conversor_pasos", 40))
+    a_cantar = [tr for tr in tramos if tr["accion"] == "cantar"]
+    if a_cantar and not hay_motor:
         log("  El canto no esta instalado (Pinokio: 'Instalar canto'): las canciones quedan con la voz original")
+    elif a_cantar and not hay_svc and cfg.get("canto_conversor", True):
+        log("  Falta el conversor de voz cantada: en Pinokio tocá 'Reinstalar canto' para que las canciones "
+            "caigan en las notas y suenen cantadas (ahora se hace como antes)")
+    timbre_m = th_m = None
+    if muestra and hay_svc and hay_motor and a_cantar:
+        timbre_m = _timbre_muestra(cfg, ref_wav, wc)
+        th_m = _md5(timbre_m)
 
     def candidatos_de(out):
         return sorted(wc.glob(f"{out.stem}_c*.wav"))
 
-    items, salidas = [], []
+    # ---------------- 1) que se hace en cada tramo
+    planes = {}
     for i, tr in enumerate(tramos):
         if tr["accion"] != "cantar" or not hay_motor:
             continue
-        if cfg.get("voz_muestra"):
-            ref, rtxt, rcod = ref_wav, ref_txt, src
-        else:
-            ref, rtxt = _ref_canto(voz, tr, wc, i)
-            rcod = tr["idioma"]
-        rh = hashlib.md5(Path(ref).read_bytes()).hexdigest()[:10]
+        misma = tr.get("idioma") == cod
+        if misma and not muestra:
+            continue  # ya se canta en este idioma y con su voz: queda la original
+        p = {"modo": "convertir" if (misma and muestra and hay_svc) else "cantar", "base": None}
+        if hay_svc and muestra:  # todo el tramo con la voz de la muestra (debajo van los trozos traducidos)
+            a, b = int(round(tr["t0"] * SR)), int(round(tr["t1"] * SR))
+            fuente = wc / f"tramo_{i}.wav"
+            sf.write(str(fuente), voz[a:b], SR)
+            p["base"] = {"id": f"base_{i}", "fuente": str(fuente), "timbre": str(timbre_m),
+                         "salida": str(wc / f"svc_base_{i}.wav"), "semitonos": None,
+                         "_h": huella(VERSION_CANTO, "base", _md5(fuente), th_m, pasos_svc)}
+        if p["modo"] == "cantar":
+            if hay_svc:  # YingMusic canta con el timbre del cantante (canto como referencia, no habla)
+                ref, rtxt = _ref_canto(voz, tr, wc, i)
+                rcod = tr["idioma"]
+                p["timbre"] = timbre_m if muestra else _ref_cantante(voz, tr, wc, i)
+                p["th"] = th_m if muestra else _md5(p["timbre"])
+            elif muestra:
+                ref, rtxt, rcod = ref_wav, ref_txt, src
+            else:
+                ref, rtxt = _ref_canto(voz, tr, wc, i)
+                rcod = tr["idioma"]
+            p.update(ref=ref, rtxt=rtxt, rcod=rcod, rh=_md5(ref))
+        planes[i] = p
+
+    # ---------------- 2) cantar los trozos traducidos (varias versiones de cada uno)
+    items, salidas = [], []
+    for i, p in planes.items():
+        if p["modo"] != "cantar":
+            continue
+        tr = tramos[i]
         for tz in tr["trozos"]:
             texto = " ".join(ln["trad"] for ln in tz["lineas"]).strip()
             if not texto:
@@ -633,13 +747,13 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
             mel = wc / f"melodia_{i}_{tz['k']}.wav"
             sf.write(str(mel), voz[int(tz["t0"] * SR):int(tz["t1"] * SR)], SR)
             out = wc / f"canto_{i}_{tz['k']}.wav"
-            hg = huella(VERSION_CANTO, texto, cod, rtxt, rh, tz["t0"], tz["t1"], nfe, n_cand)
-            hf = huella(hg, proc_h)
-            salidas.append((i, tz, out, hf, hg, texto, mel))
+            hg = huella(VERSION_CANTO, texto, cod, p["rtxt"], p["rh"], tz["t0"], tz["t1"], nfe, n_cand)
+            salidas.append({"i": i, "tz": tz, "out": out, "hg": hg, "texto": texto, "mel": mel})
             if FORZAR or indice.get("gen:" + out.name) != hg or not candidatos_de(out):
-                items.append({"id": out.name, "melodia": str(mel), "ref": str(ref), "ref_texto": rtxt,
-                              "ref_idioma": rcod, "texto": texto, "idioma": cod, "salida": str(out),
+                items.append({"id": out.name, "melodia": str(mel), "ref": str(p["ref"]), "ref_texto": p["rtxt"],
+                              "ref_idioma": p["rcod"], "texto": texto, "idioma": cod, "salida": str(out),
                               "semilla": 1000 + 97 * i + tz["k"], "_h": hg})
+    pct_canto = [2, 20] if hay_svc else [2, 30]
     if items:
         log(f"  Cantando {len(items)} trozo(s) en {cfg.get('idioma_nombre', cod)}"
             + (f", {n_cand} versiones de cada uno" if n_cand > 1 else "") + "...")
@@ -649,22 +763,17 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
         if SIMULAR:
             res = {}
             for it in items:
-                y, _ = sf.read(it["melodia"], dtype="float32")
+                y = _leer_mono(it["melodia"])
                 for j in range(n_cand):
                     sf.write(str(Path(it["salida"]).with_name(f"{Path(it['salida']).stem}_c{j}.wav")),
                              np.stack([y, y], 1) * (0.9 - 0.1 * j), SR)
                 res[it["id"]] = {"ok": True}
         else:
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            _liberar_gpu()
             trabajo = wc / "trabajo.json"
             escribir_json(trabajo, {"repo": str(REPO), "modelo": cfg.get("canto_modelo", "ASLP-lab/YingMusic-Singer-Plus"),
-                                    "nfe": nfe, "cfg": float(cfg.get("canto_cfg", 3.0)), "cap": cap, "pct": [2, 30],
-                                    "candidatos": n_cand,
+                                    "nfe": nfe, "cfg": float(cfg.get("canto_cfg", 3.0)), "cap": cap,
+                                    "pct": pct_canto, "candidatos": n_cand,
                                     "items": [{k: v for k, v in it.items() if k != "_h"} for it in items]})
             try:
                 res = correr_motor(trabajo)
@@ -679,79 +788,198 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
                 log(f"  No se pudo cantar {it['id']}: {res.get(it['id'], {}).get('error', 'sin resultado')}")
         escribir_json(idx_p, indice)
 
-    # elegir la mejor version de cada trozo, afinarla y darle sonido de voz cantada
-    aviso_afinar = False
+    # ---------------- 3) elegir la mejor version de cada trozo (la que mas se entiende y mas cerca de la melodia)
     recien = {it["id"] for it in items}
-    for (i, tz, out, hf, hg, texto, mel) in salidas:
-        if out.exists() and indice.get(out.name) == hf and out.name not in recien:
-            continue  # ya elegido y procesado con estos mismos ajustes
+    for s in salidas:
+        out, tz = s["out"], s["tz"]
+        eleg = wc / f"elegido_{out.stem}.wav"
+        s["eleg"] = eleg
+        s["he"] = huella(s["hg"], "elegido")
         cands = candidatos_de(out)
-        if indice.get("gen:" + out.name) != hg or not cands:
+        if indice.get("gen:" + out.name) != s["hg"] or not cands:
+            s["he"] = None
+            continue
+        if eleg.exists() and indice.get(eleg.name) == s["he"] and out.name not in recien:
             continue
         n = int(round((tz["t1"] - tz["t0"]) * SR))
         orig = voz[int(tz["t0"] * SR):int(tz["t0"] * SR) + n]
         mejor = None
         for j, c in enumerate(cands):
-            y, sr_y = sf.read(str(c), dtype="float32")
-            if y.ndim > 1:
-                y = y.mean(1)
-            if sr_y != SR:
-                import librosa
-                y = librosa.resample(y, orig_sr=sr_y, target_sr=SR)
-            y = np.pad(y, (0, max(0, n - len(y))))[:n]
+            y = np.pad(_leer_mono(c), (0, n))[:n]
             oido = motor.escuchar(y, SR) if motor is not None else None
-            w_ = wer(texto, oido) if oido is not None else 0.0
+            w_ = wer(s["texto"], oido) if oido is not None else 0.0
             try:
                 cents, _ = desafinacion(y, orig, SR)
             except Exception:
                 cents = None
-            puntaje = w_ + 0.5 * min(1.0, (cents if cents is not None else 100.0) / 200.0)
+            puntaje = w_ + (0.3 if hay_svc else 0.5) * min(1.0, (cents if cents is not None else 100.0) / 200.0)
             if mejor is None or puntaje < mejor[0]:
                 mejor = (puntaje, j, y, w_, cents, oido)
         _, j, y, w_, cents, oido = mejor
-        nota = f"versión {j + 1}/{len(cands)}, se entiende {100 * max(0.0, 1 - w_):.0f}%"
-        if afina and cents is not None and cents > float(cfg.get("canto_afinar_umbral", 15)):
+        sf.write(str(eleg), y, SR, subtype="FLOAT")
+        indice[eleg.name] = s["he"]
+        indice["nota:" + eleg.name] = {"j": j, "n": len(cands), "wer": round(w_, 3),
+                                       "cents": None if cents is None else round(cents, 1),
+                                       "oido": (oido or "")[:120]}
+    escribir_json(idx_p, indice)
+
+    # ---------------- 4) conversor: la voz cae en las notas del original, con el timbre que corresponde
+    def hecho(c):
+        return indice.get("svc:" + Path(c["salida"]).name) == c["_h"] and Path(c["salida"]).exists()
+
+    if hay_svc:
+        conv = [p["base"] for p in planes.values() if p["base"]]
+        for s in salidas:
+            if not s.get("he"):
+                continue
+            p = planes[s["i"]]
+            s["svc"] = wc / f"svc_{s['out'].stem}.wav"
+            conv.append({"id": s["svc"].stem, "fuente": str(s["eleg"]), "guia": str(s["mel"]),
+                         "timbre": str(p["timbre"]), "salida": str(s["svc"]), "_s": s, "_base": p["base"],
+                         "_h": huella(VERSION_CANTO, s["he"], p["th"], pasos_svc,
+                                      p["base"]["_h"] if p["base"] else None)})
+        pend = [c for c in conv if FORZAR or not hecho(c)]
+        ids_pend = {c["id"] for c in pend}
+        for c in pend:
+            if "_s" not in c:
+                continue  # una base: octava automatica
+            b = c["_base"]
+            if b is None:
+                c["semitonos"] = 0  # timbre del mismo cantante: la misma octava
+            elif b["id"] in ids_pend:
+                c["semitonos"] = b["id"]  # la octava que se elija para todo el tramo
+            else:
+                c["semitonos"] = indice.get("oct:" + Path(b["salida"]).name)
+        pend.sort(key=lambda c: 1 if "_s" in c else 0)  # las bases primero
+        if pend:
+            log(f"  Llevando la voz cantada a las notas del original ({len(pend)} parte(s))...")
+            if SIMULAR:
+                res = {}
+                for c in pend:
+                    sf.write(c["salida"], _leer_mono(c["fuente"]) * 0.8, SR, subtype="FLOAT")
+                    res[c["id"]] = {"ok": True, "semitonos": 0}
+            else:
+                _liberar_gpu()
+                trabajo = wc / "conversion.json"
+                escribir_json(trabajo, {"tipo": "convertir", "repo_svc": str(REPO_SVC), "pasos": pasos_svc,
+                                        "cfg_rate": float(cfg.get("canto_conversor_cfg", 0.7)), "cap": cap,
+                                        "pct": [20, 30],
+                                        "items": [{k: v for k, v in c.items() if not k.startswith("_")}
+                                                  for c in pend]})
+                try:
+                    res = correr_motor(trabajo)
+                except Exception:
+                    log_error("convertir la voz cantada (queda como antes)")
+                    res = {}
+            for c in pend:
+                nombre = Path(c["salida"]).name
+                r = res.get(c["id"], {})
+                if r.get("ok"):
+                    indice["svc:" + nombre] = c["_h"]
+                    indice["oct:" + nombre] = r.get("semitonos", 0)
+                else:
+                    indice.pop("svc:" + nombre, None)
+                    log(f"  No se pudo convertir {c['id']}: {r.get('error', 'sin resultado')}")
+            escribir_json(idx_p, indice)
+        for c in conv:
+            if "_s" in c:
+                c["_s"]["svc_ok"] = hecho(c)
+        for p in planes.values():
+            p["base_ok"] = bool(p["base"]) and hecho(p["base"])
+
+    # ---------------- 5) terminar cada trozo: afinar si no paso por el conversor, y sonido de voz cantada
+    aviso_afinar = False
+    for s in salidas:
+        if not s.get("he") or not s["eleg"].exists():
+            continue
+        out, tz = s["out"], s["tz"]
+        usa_svc = bool(s.get("svc_ok"))
+        hf = huella(s["he"], proc_h, indice.get("svc:" + s["svc"].name) if usa_svc else None)
+        if out.exists() and indice.get(out.name) == hf:
+            s["hf"] = hf
+            continue
+        n = int(round((tz["t1"] - tz["t0"]) * SR))
+        orig = voz[int(tz["t0"] * SR):int(tz["t0"] * SR) + n]
+        nota_e = indice.get("nota:" + s["eleg"].name, {})
+        nota = (f"versión {nota_e.get('j', 0) + 1}/{nota_e.get('n', 1)}, "
+                f"se entiende {100 * max(0.0, 1 - nota_e.get('wer', 0.0)):.0f}%")
+        if usa_svc:
+            y = np.pad(_leer_mono(s["svc"]), (0, n))[:n]
             try:
-                y, antes, despues = afinar(y, orig, SR, float(cfg.get("canto_afinar_fuerza", 1.0)))
-                if antes is not None:
-                    nota += f", afinado {antes:.0f} -> {despues:.0f} cents"
-            except ImportError:
-                if not aviso_afinar:
-                    log("  Falta pyworld para afinar (se instala solo al reiniciar la app)")
-                    aviso_afinar = True
+                cents, _ = desafinacion(y, orig, SR)
+                if cents is not None:
+                    nota += f", en las notas del original ({cents:.0f} cents)"
             except Exception:
-                log_error("afinar el canto")
-        elif cents is not None:
-            nota += f", afinación {cents:.0f} cents"
+                pass
+        else:
+            y = np.pad(_leer_mono(s["eleg"]), (0, n))[:n]
+            cents = nota_e.get("cents")
+            if afina and cents is not None and cents > float(cfg.get("canto_afinar_umbral", 15)):
+                try:
+                    y, antes, despues = afinar(y, orig, SR, float(cfg.get("canto_afinar_fuerza", 1.0)))
+                    if antes is not None:
+                        nota += f", afinado {antes:.0f} -> {despues:.0f} cents"
+                except ImportError:
+                    if not aviso_afinar:
+                        log("  Falta pyworld para afinar (se instala solo al reiniciar la app)")
+                        aviso_afinar = True
+                except Exception:
+                    log_error("afinar el canto")
+            elif cents is not None:
+                nota += f", afinación {cents:.0f} cents"
         try:
             y = sonido_voz(y, SR, cfg)
         except Exception:
             log_error("procesar la voz cantada")
         sf.write(str(out), y, SR, subtype="FLOAT")
         indice[out.name] = hf
-        log(f"  Trozo {out.stem}: {nota}" + (f" | oído: {oido[:80]}" if oido and w_ > 0.3 else ""))
+        s["hf"] = hf
+        oido = nota_e.get("oido", "")
+        log(f"  Trozo {out.stem}: {nota}" + (f" | oído: {oido[:80]}" if oido and nota_e.get("wer", 0) > 0.3 else ""))
+    # bases convertidas: mismo sonido de voz
+    for i, p in planes.items():
+        if not p.get("base_ok"):
+            continue
+        fin = wc / f"base_{i}.wav"
+        hb = huella(p["base"]["_h"], proc_h)
+        p["fin"] = fin
+        if fin.exists() and indice.get(fin.name) == hb:
+            continue
+        y = _leer_mono(p["base"]["salida"])
+        try:
+            y = sonido_voz(y, SR, cfg)
+        except Exception:
+            log_error("procesar la voz cantada")
+        sf.write(str(fin), y, SR, subtype="FLOAT")
+        indice[fin.name] = hb
+        semi = indice.get("oct:" + Path(p["base"]["salida"]).name, 0)
+        log(f"  Canción {tramos[i]['t0']:.0f}-{tramos[i]['t1']:.0f}s: voz llevada a la muestra"
+            + (f" (una octava {'arriba' if semi > 0 else 'abajo'})" if semi else ""))
     escribir_json(idx_p, indice)
 
+    # ---------------- 6) armar cada tramo
     resultado = []
     for i, tr in enumerate(tramos):
         a = int(round(tr["t0"] * SR))
-        base = voz[a:a + int(round((tr["t1"] - tr["t0"]) * SR))].copy()
+        largo = int(round((tr["t1"] - tr["t0"]) * SR))
+        orig_tramo = voz[a:a + largo]
+        base = orig_tramo.copy()
+        p = planes.get(i, {})
         cantados = 0
-        for (j, tz, out, hf, hg, texto, mel) in salidas:
-            if j != i or not out.exists() or indice.get(out.name) != hf:
+        if p.get("fin") is not None and p["fin"].exists():
+            yb = np.pad(_leer_mono(p["fin"]), (0, len(base)))[:len(base)]
+            r_o, r_n = rms_activo(orig_tramo), rms_activo(yb)
+            base = yb * (r_o / r_n) if r_n > 0 and r_o > 0 else yb
+        for s in salidas:
+            if s["i"] != i or not s["out"].exists() or s.get("hf") is None or indice.get(s["out"].name) != s["hf"]:
                 continue
-            y, sr_y = sf.read(str(out), dtype="float32")
-            if y.ndim > 1:
-                y = y.mean(1)
-            if sr_y != SR:
-                import librosa
-                y = librosa.resample(y, orig_sr=sr_y, target_sr=SR)
+            tz = s["tz"]
             i0 = int(round((tz["t0"] - tr["t0"]) * SR))
             n = min(int(round((tz["t1"] - tz["t0"]) * SR)), len(base) - i0)
             if n <= 0:
                 continue
-            y = np.pad(y, (0, max(0, n - len(y))))[:n]
-            r_o, r_n = rms_activo(base[i0:i0 + n]), rms_activo(y)
+            y = np.pad(_leer_mono(s["out"]), (0, n))[:n]
+            r_o, r_n = rms_activo(orig_tramo[i0:i0 + n]), rms_activo(y)
             if r_n > 0 and r_o > 0:
                 y = y * (r_o / r_n)
             fade = min(int(0.03 * SR), n // 4)
@@ -761,9 +989,25 @@ def preparar_cantos(d, w, cfg, tramos, ref_wav, ref_txt, src, cap, motor=None):
                 env[-fade:] = np.linspace(1, 0, fade)
             base[i0:i0 + n] = base[i0:i0 + n] * (1 - env) + y * env
             cantados += 1
-        resultado.append({"t0": tr["t0"], "t1": tr["t1"], "voz": base, "accion": tr["accion"],
-                          "cantados": cantados, "lineas": [ln for tz in tr["trozos"] for ln in tz["lineas"]]})
+        modo = p.get("modo", "mantener")
+        if modo == "convertir" and p.get("fin") is None:
+            modo = "mantener"  # no se pudo: queda la original
+        resultado.append({"t0": tr["t0"], "t1": tr["t1"], "voz": base, "accion": tr["accion"], "modo": modo,
+                          "cantados": cantados, "voz_cambiada": p.get("fin") is not None,
+                          "lineas": [ln for tz in tr["trozos"] for ln in tz["lineas"]]})
     return resultado
+
+
+def _liberar_gpu():
+    try:
+        import gc
+
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def fps_video(video):
@@ -1051,6 +1295,7 @@ def doblar_ajustando_video(d, w, cfg, es, bloques, clips, informe, video, out_mp
                                        "duracion_nueva": total, "tramos": segs, "bloques": informe,
                                        "colocados": colocados, "revisar_wer": [x["id"] for x in flojos],
                                        "canciones": [{"t0": c["t0"], "t1": c["t1"], "accion": c["accion"],
+                                                      "modo": c.get("modo"), "voz_cambiada": c.get("voz_cambiada"),
                                                       "trozos_cantados": c.get("cantados", 0)} for c in cantos],
                                        "acelerados": [(c["id"], c["factor"]) for c in colocados if c["factor"] > 1],
                                        "desfasados": [(c["id"], c["desfase"]) for c in desfasados]})
@@ -1069,8 +1314,11 @@ def _anotar_voz(w, ref_hash, canto_cfg=None):
 
 def canto_ajustes(cfg):
     """Ajustes del canto que cambian el resultado (si cambian, se vuelve a armar el doblaje)."""
+    from canto import conversor_instalado
     return [VERSION_CANTO, bool(cfg.get("canto_afinar", True)), float(cfg.get("canto_sala", 0.12)),
-            int(cfg.get("canto_versiones", 3))]
+            int(cfg.get("canto_versiones", 3)),
+            bool(cfg.get("canto_conversor", True)) and (SIMULAR or conversor_instalado()),
+            int(cfg.get("canto_conversor_pasos", 40))]
 
 
 def doblar(d, cfg, motor):

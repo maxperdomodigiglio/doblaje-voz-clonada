@@ -4,6 +4,8 @@
   4 s y dice si es habla o canto. Los tramos cantados se vuelven a transcribir en su propio idioma.
 - Canto: YingMusic-Singer-Plus vuelve a cantar cada trozo con la letra traducida, siguiendo la melodia de la
   voz original y con su timbre. Corre en su propio entorno (env_canto) via canto/canto_motor.py.
+- Voz: YingMusic-SVC lleva la voz cantada al timbre de la muestra sin tocar las notas, y obliga al canto
+  generado a caer en las notas exactas de la melodia original.
 """
 import hashlib
 import json
@@ -24,6 +26,7 @@ ETQ_CANTO = {"Singing", "Choir", "Yodeling", "Chant", "Mantra", "Male singing", 
 ETQ_HABLA = {"Speech", "Male speech, man speaking", "Female speech, woman speaking", "Child speech, kid speaking",
              "Conversation", "Narration, monologue", "Speech synthesizer", "Whispering"}
 REPO = APP_DIR / "canto" / "YingMusic-Singer-Plus"
+REPO_SVC = APP_DIR / "canto" / "YingMusic-SVC"
 MOTOR = APP_DIR / "canto" / "canto_motor.py"
 SR16 = 16000
 
@@ -38,6 +41,11 @@ def python_canto():
 
 def motor_instalado():
     return python_canto() is not None and (REPO / "src" / "YingMusicSinger").is_dir()
+
+
+def conversor_instalado():
+    """El conversor de voz cantada (YingMusic-SVC) viene con 'Instalar canto' desde la version 15."""
+    return python_canto() is not None and (REPO_SVC / "modules" / "rmvpe.py").exists()
 
 
 # ---------------------------------------------------------------- deteccion
@@ -299,6 +307,8 @@ def correr_motor(trabajo_json, log_cb=None):
     if py is None:
         raise RuntimeError("El canto no esta instalado (en Pinokio: 'Instalar canto')")
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+    res = Path(trabajo_json).with_name(Path(trabajo_json).stem + "_resultado.json")
+    res.unlink(missing_ok=True)  # que no se lea el resultado de una corrida anterior
     p = subprocess.Popen([str(py), str(MOTOR), str(trabajo_json)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          env=env, text=True, encoding="utf-8", errors="replace", bufsize=1)
     ultimas = []
@@ -313,7 +323,6 @@ def correr_motor(trabajo_json, log_cb=None):
         if linea.startswith("[canto]") or "Error" in linea or "error" in linea:
             log("  " + linea)
     p.wait()
-    res = Path(trabajo_json).with_name(Path(trabajo_json).stem + "_resultado.json")
     if not res.exists():
         raise RuntimeError("el motor de canto se corto:\n" + "\n".join(ultimas[-12:]))
     return {r["id"]: r for r in leer_json(res)["items"]}
