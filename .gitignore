@@ -12,4 +12,5 @@ GEMINI.md
 QWEN.md
 app/env_canto/
 app/canto/YingMusic-Singer-Plus/
+app/canto/YingMusic-SVC/
 __pycache__/

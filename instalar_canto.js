@@ -3,7 +3,7 @@ module.exports = {
     bundle: "ai",
   },
   run: [
-    // 1) codigo de YingMusic-Singer-Plus (version fija)
+    // 1) codigo de YingMusic-Singer-Plus y de YingMusic-SVC (versiones fijas)
     {
       method: "shell.run",
       params: {
@@ -48,11 +48,23 @@ module.exports = {
         ]
       }
     },
+    // 4) pesos del conversor de voz cantada (~3 GB, una sola vez; si se corta, retoma)
+    {
+      method: "shell.run",
+      params: {
+        venv: "env_canto",
+        path: "app",
+        env: { PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
+        message: [
+          "python canto/canto_motor.py --bajar-conversor"
+        ]
+      }
+    },
     {
       method: "input",
       params: {
         title: "Canto instalado",
-        description: "Listo. Volve a Iniciar la app y deja tildado 'Cantar las canciones'. La primera vez que cante baja el modelo de canto (~3 GB)."
+        description: "Listo. Volve a Iniciar la app y deja tildado 'Cantar las canciones'. La primera vez que cante baja el modelo de canto (~3 GB) si no estaba."
       }
     }
   ]

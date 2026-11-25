@@ -45,16 +45,27 @@ No pongas la muestra de voz dentro de la carpeta de los videos: se doblaría com
 Si un video o audio tiene partes cantadas, la app las detecta sola y las **vuelve a cantar en el idioma del
 doblaje, con la misma melodía y el timbre del cantante** (YingMusic-Singer-Plus). Lo hablado se dobla como siempre.
 
-1. En Pinokio tocá **🎵 Instalar canto** (una sola vez, ~8 GB más; el modelo de canto, ~3 GB, se baja la primera
-   vez que canta).
+En las canciones manda la música: **la voz tiene que caer en las notas, no al revés**. Por eso, además de cantar,
+la app usa un **conversor de voz cantada** (YingMusic-SVC) que toma las notas, el ritmo y el vibrato del cantante
+original y solo cambia quién canta:
+
+- **Canción ya en el idioma del doblaje + voz de una muestra:** no se vuelve a cantar; se convierte la voz original a
+  la de la muestra. Suena como el cantante, pero con tu voz.
+- **Canción traducida:** se canta la letra nueva con el timbre del cantante (nunca con la muestra hablada, que la hacía
+  sonar recitada) y el conversor la hace caer en las notas exactas de la melodía original, con la voz de la muestra
+  si la hay.
+
+1. En Pinokio tocá **🎵 Instalar canto** (una sola vez, ~11 GB más con el conversor; el modelo de canto, ~3 GB, se
+   baja la primera vez que canta). Si ya lo tenías instalado, aparece **🎵 Actualizar canto** para sumar el conversor.
 2. En la interfaz dejá tildado **🎵 Cantar las canciones** y tocá **▶ Hacer todo**.
 
 - La letra se traduce buscando la misma cantidad de sílabas por línea, para que entre en las notas.
 - Canta 3 versiones de cada trozo y se queda con la que mejor se entiende (la escucha con Whisper) y más afinada.
-- **Autotune guiado:** la voz nueva se afina a la melodía exacta del cantante original (con su vibrato), y se le
-  da sonido de voz cantada (presencia, compresión suave y un poco de sala). Se puede apagar en ⚙️ Opciones avanzadas.
+- **Notas exactas:** el conversor lleva la voz nueva a la melodía del cantante original (con su vibrato), en la
+  octava que le queda cómoda a la voz destino, y se le da sonido de voz cantada (presencia, compresión suave y un
+  poco de sala). Sin el conversor se afina con WORLD como antes (se puede apagar en ⚙️ Opciones avanzadas).
 - Las partes cantadas van a velocidad normal (el video no se acelera ahí) y la música no se baja.
-- Si una canción ya está en el idioma del doblaje, queda la original.
+- Si una canción ya está en el idioma del doblaje y la voz es la del video, queda la original.
 - El inglés es el que mejor canta; alemán, ruso y castellano salen con pronunciación aproximada (experimental).
 - Si algún trozo no se puede cantar, queda la voz original en ese trozo.
 - En cada video aparece 🎵 con la cantidad de partes cantadas que encontró.
@@ -66,5 +77,6 @@ Importante: cloná solo voces de personas que te hayan dado permiso.
 
 ## Créditos
 Demucs (Meta), Whisper (OpenAI), Qwen3-TTS y Qwen3 (Alibaba), YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; su VAE
-es de Stable Audio Open, Stability AI Community License), detector de sonidos AST (MIT), espeak-ng, y las capas
+es de Stable Audio Open, Stability AI Community License), YingMusic-SVC (GiantAILab, código MIT; usa RMVPE,
+CAM++ de FunASR, BigVGAN v2 de NVIDIA y Whisper), detector de sonidos AST (MIT), espeak-ng, y las capas
 de descript-audio-codec (MIT) en `app/canto/dac_min`.

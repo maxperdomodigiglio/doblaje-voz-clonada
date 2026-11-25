@@ -21,11 +21,19 @@ const cantoInstalado = () => {
     fs.existsSync(path.join(app, "canto", "YingMusic-Singer-Plus", "src", "YingMusicSinger"))
 }
 
-const itemCanto = () => cantoInstalado() ? {
+// conversor de voz cantada (YingMusic-SVC): viene con el canto desde la v15
+const conversorInstalado = () =>
+  fs.existsSync(path.join(__dirname, "app", "canto", "YingMusic-SVC", "modules", "rmvpe.py"))
+
+const itemCanto = () => cantoInstalado() ? (conversorInstalado() ? {
   icon: "fa-solid fa-music",
-  text: "<div><strong>Reinstalar canto</strong><div>YingMusic-Singer (canciones)</div></div>",
+  text: "<div><strong>Reinstalar canto</strong><div>YingMusic-Singer + conversor de voz (canciones)</div></div>",
   href: "instalar_canto.js",
 } : {
+  icon: "fa-solid fa-music",
+  text: "<div><strong>Actualizar canto</strong><div>Nuevo: la voz cae en las notas de la cancion (~3 GB)</div></div>",
+  href: "instalar_canto.js",
+}) : {
   icon: "fa-solid fa-music",
   text: "<div><strong>Instalar canto</strong><div>Para cantar las canciones traducidas (~8 GB)</div></div>",
   href: "instalar_canto.js",
