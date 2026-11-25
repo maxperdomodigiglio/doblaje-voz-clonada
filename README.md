@@ -41,7 +41,27 @@ Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que fa
 
 No pongas la muestra de voz dentro de la carpeta de los videos: se doblaría como un audio más.
 
+## 🎵 Canciones (opcional)
+Si un video o audio tiene partes cantadas, la app las detecta sola y las **vuelve a cantar en el idioma del
+doblaje, con la misma melodía y el timbre del cantante** (YingMusic-Singer-Plus). Lo hablado se dobla como siempre.
+
+1. En Pinokio tocá **🎵 Instalar canto** (una sola vez, ~8 GB más; el modelo de canto, ~3 GB, se baja la primera
+   vez que canta).
+2. En la interfaz dejá tildado **🎵 Cantar las canciones** y tocá **▶ Hacer todo**.
+
+- La letra se traduce buscando la misma cantidad de sílabas por línea, para que entre en las notas.
+- Las partes cantadas van a velocidad normal (el video no se acelera ahí) y la música no se baja.
+- Si una canción ya está en el idioma del doblaje, queda la original.
+- El inglés es el que mejor canta; alemán, ruso y castellano salen con pronunciación aproximada (experimental).
+- Si algún trozo no se puede cantar, queda la voz original en ese trozo.
+- En cada video aparece 🎵 con la cantidad de partes cantadas que encontró.
+
 La primera vez se descargan los modelos (Whisper, Demucs, Qwen3-TTS y el traductor local, unos 16 GB).
 En `_proceso/capNN/revisar_XX.txt` queda una lista de lo dudoso de cada video, para revisarlo.
 
 Importante: cloná solo voces de personas que te hayan dado permiso.
+
+## Créditos
+Demucs (Meta), Whisper (OpenAI), Qwen3-TTS y Qwen3 (Alibaba), YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; su VAE
+es de Stable Audio Open, Stability AI Community License), detector de sonidos AST (MIT), espeak-ng, y las capas
+de descript-audio-codec (MIT) en `app/canto/dac_min`.

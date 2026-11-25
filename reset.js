@@ -4,5 +4,10 @@ module.exports = {
     params: {
       path: "app/env"
     }
+  }, {
+    method: "fs.rm",
+    params: {
+      path: "app/env_canto"
+    }
   }]
 }

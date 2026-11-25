@@ -13,6 +13,24 @@ const instalado = () => {
   return cands.some((p) => fs.existsSync(p))
 }
 
+// canto instalado = entorno env_canto + codigo de YingMusic-Singer-Plus
+const cantoInstalado = () => {
+  const app = path.join(__dirname, "app")
+  const py = [path.join(app, "env_canto", "Scripts", "python.exe"), path.join(app, "env_canto", "bin", "python")]
+  return py.some((p) => fs.existsSync(p)) &&
+    fs.existsSync(path.join(app, "canto", "YingMusic-Singer-Plus", "src", "YingMusicSinger"))
+}
+
+const itemCanto = () => cantoInstalado() ? {
+  icon: "fa-solid fa-music",
+  text: "<div><strong>Reinstalar canto</strong><div>YingMusic-Singer (canciones)</div></div>",
+  href: "instalar_canto.js",
+} : {
+  icon: "fa-solid fa-music",
+  text: "<div><strong>Instalar canto</strong><div>Para cantar las canciones traducidas (~8 GB)</div></div>",
+  href: "instalar_canto.js",
+}
+
 module.exports = {
   version: "3.7",
   title: "Doblaje Gregorio",
@@ -21,11 +39,15 @@ module.exports = {
   menu: async (kernel, info) => {
     const r = {
       install: info.running("install.js"),
+      canto: info.running("instalar_canto.js"),
       start: info.running("start.js"),
       reset: info.running("reset.js"),
     }
     if (r.install) {
       return [{ default: true, icon: "fa-solid fa-plug", text: "Instalando...", href: "install.js" }]
+    }
+    if (r.canto) {
+      return [{ default: true, icon: "fa-solid fa-music", text: "Instalando el canto...", href: "instalar_canto.js" }]
     }
     if (r.reset) {
       return [{ default: true, icon: "fa-solid fa-terminal", text: "Borrando entorno...", href: "reset.js" }]
@@ -45,7 +67,7 @@ module.exports = {
           icon: "fa-solid fa-terminal",
           text: "Terminal",
           href: "start.js",
-        }]
+        }, itemCanto()]
       }
       return [{ default: true, icon: "fa-solid fa-terminal", text: "Iniciando...", href: "start.js" }]
     }
@@ -54,7 +76,7 @@ module.exports = {
       icon: "fa-solid fa-power-off",
       text: "<div><strong>Iniciar</strong><div>Abre la interfaz del doblaje</div></div>",
       href: "start.js",
-    }, {
+    }, itemCanto(), {
       icon: "fa-solid fa-plug",
       text: "Reinstalar",
       href: "install.js",
@@ -62,7 +84,7 @@ module.exports = {
       icon: "fa-regular fa-circle-xmark",
       text: "Borrar entorno",
       href: "reset.js",
-      confirm: "¿Borrar el entorno de Python? (no toca tus videos)"
+      confirm: "¿Borrar los entornos de Python (doblaje y canto)? (no toca tus videos)"
     }]
   }
 }
