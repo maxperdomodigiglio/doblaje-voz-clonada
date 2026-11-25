@@ -8,7 +8,7 @@ module.exports = {
         path: "app",
         env: { PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
         message: [
-          "uv pip install num2words",
+          "uv pip install num2words pyworld",
           "python ui.py"
         ],
         on: [{

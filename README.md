@@ -50,6 +50,9 @@ doblaje, con la misma melodía y el timbre del cantante** (YingMusic-Singer-Plus
 2. En la interfaz dejá tildado **🎵 Cantar las canciones** y tocá **▶ Hacer todo**.
 
 - La letra se traduce buscando la misma cantidad de sílabas por línea, para que entre en las notas.
+- Canta 3 versiones de cada trozo y se queda con la que mejor se entiende (la escucha con Whisper) y más afinada.
+- **Autotune guiado:** la voz nueva se afina a la melodía exacta del cantante original (con su vibrato), y se le
+  da sonido de voz cantada (presencia, compresión suave y un poco de sala). Se puede apagar en ⚙️ Opciones avanzadas.
 - Las partes cantadas van a velocidad normal (el video no se acelera ahí) y la música no se baja.
 - Si una canción ya está en el idioma del doblaje, queda la original.
 - El inglés es el que mejor canta; alemán, ruso y castellano salen con pronunciación aproximada (experimental).
