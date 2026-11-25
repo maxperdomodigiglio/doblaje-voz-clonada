@@ -7,11 +7,12 @@ Stable Audio Open, Stability AI Community License). Lo llama paso3_doblar.py asi
 
 trabajo.json:
     {"repo": ".../YingMusic-Singer-Plus", "modelo": "ASLP-lab/YingMusic-Singer-Plus", "nfe": 32, "cfg": 3.0,
-     "cap": "cap01", "pct": [2, 30],
+     "cap": "cap01", "pct": [2, 30], "candidatos": 3,
      "items": [{"id": "t0_k0", "melodia": "x.wav", "ref": "r.wav", "ref_texto": "...", "ref_idioma": "es",
                 "texto": "...", "idioma": "en", "salida": "y.wav", "semilla": 1234}]}
 
-Deja <trabajo>_resultado.json con {"items": [{"id", "ok", "error", "dur"}]} y va imprimiendo @@P {...}.
+Deja <trabajo>_resultado.json con {"items": [{"id", "ok", "error", "dur", "candidatos": [wav, ...]}]} y va
+imprimiendo @@P {...}. Con "candidatos": N canta N versiones de cada trozo (salida_c0.wav, salida_c1.wav...).
 """
 import json
 import os
@@ -149,26 +150,35 @@ def main():
     modelo.cnen_tokenizer = tok
     print(f"[canto] modelo listo en {dev}", flush=True)
 
+    n_cand = max(1, int(trabajo.get("candidatos", 1)))  # varias versiones por trozo: despues se elige la mejor
     for k, it in enumerate(items):
         t0 = time.time()
-        progreso(trabajo, (k + 0.05) / max(1, len(items)), f"cantando: trozo {k + 1} de {len(items)}")
-        r = {"id": it["id"], "ok": False}
-        try:
-            tok.cola = [it.get("ref_idioma", "es"), it.get("idioma", "en")]
-            audio, sr = modelo(
-                ref_audio_path=it["ref"], melody_audio_path=it["melodia"],
-                ref_text=it.get("ref_texto", "").strip() or ".", target_text=it["texto"].strip(),
-                lrc_align_mode="sentence_level", sil_len_to_end=0.5, t_shift=0.5,
-                nfe_step=int(trabajo.get("nfe", 32)), cfg_strength=float(trabajo.get("cfg", 3.0)),
-                seed=int(it.get("semilla", 666)),
-            )
-            Path(it["salida"]).parent.mkdir(parents=True, exist_ok=True)
-            torchaudio.save(it["salida"], audio.to("cpu"), sample_rate=sr)
-            r.update(ok=True, dur=round(audio.shape[-1] / sr, 3), seg=round(time.time() - t0, 1))
-            print(f"[canto] {it['id']}: {r['dur']:.1f} s en {r['seg']:.0f} s", flush=True)
-        except Exception as e:
-            r["error"] = f"{type(e).__name__}: {e}"
-            print(f"[canto] ERROR en {it['id']}:\n{traceback.format_exc()}", flush=True)
+        r = {"id": it["id"], "ok": False, "candidatos": []}
+        sal = Path(it["salida"])
+        sal.parent.mkdir(parents=True, exist_ok=True)
+        for j in range(n_cand):
+            progreso(trabajo, (k + (j + 0.05) / n_cand) / max(1, len(items)),
+                     f"cantando: trozo {k + 1} de {len(items)}" + (f" (versión {j + 1} de {n_cand})" if n_cand > 1 else ""))
+            try:
+                tok.cola = [it.get("ref_idioma", "es"), it.get("idioma", "en")]
+                audio, sr = modelo(
+                    ref_audio_path=it["ref"], melody_audio_path=it["melodia"],
+                    ref_text=it.get("ref_texto", "").strip() or ".", target_text=it["texto"].strip(),
+                    lrc_align_mode="sentence_level", sil_len_to_end=0.5, t_shift=0.5,
+                    nfe_step=int(trabajo.get("nfe", 32)), cfg_strength=float(trabajo.get("cfg", 3.0)),
+                    seed=int(it.get("semilla", 666)) + 7919 * j,
+                )
+                dest = sal if n_cand == 1 else sal.with_name(f"{sal.stem}_c{j}{sal.suffix}")
+                torchaudio.save(str(dest), audio.to("cpu"), sample_rate=sr)
+                r["candidatos"].append(str(dest))
+                r.update(ok=True, dur=round(audio.shape[-1] / sr, 3))
+            except Exception as e:
+                r["error"] = f"{type(e).__name__}: {e}"
+                print(f"[canto] ERROR en {it['id']} (version {j + 1}):\n{traceback.format_exc()}", flush=True)
+        r["seg"] = round(time.time() - t0, 1)
+        if r["ok"]:
+            print(f"[canto] {it['id']}: {len(r['candidatos'])} version(es) de {r['dur']:.1f} s en {r['seg']:.0f} s",
+                  flush=True)
         resultados.append(r)
         res_ruta.write_text(json.dumps({"items": resultados}, ensure_ascii=False, indent=1), encoding="utf-8")
     progreso(trabajo, 1.0, "canto listo")
