@@ -1,0 +1,12 @@
+# lo que crea Pinokio / la app al usarla (no va al repo)
+app/env/
+app/modelos/
+app/__pycache__/
+app/ui_ajustes.json
+cache/
+logs/
+ENVIRONMENT
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+QWEN.md
