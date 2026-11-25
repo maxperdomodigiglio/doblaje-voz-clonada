@@ -1,4 +1,5 @@
-"""Motor de canto: vuelve a cantar un tramo con otra letra, conservando la melodia original.
+"""Motor de canto: vuelve a cantar un tramo con otra letra, conservando la melodia original, y lleva una voz
+cantada a otro timbre sin tocar sus notas (trabajos "tipo": "convertir", ver conversor.py).
 
 Corre en su propio entorno (app/env_canto) con YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; el VAE es de
 Stable Audio Open, Stability AI Community License). Lo llama paso3_doblar.py asi:
@@ -125,6 +126,14 @@ def progreso(trabajo, frac, det):
 def main():
     ruta = Path(sys.argv[1]).resolve()
     trabajo = json.loads(ruta.read_text(encoding="utf-8"))
+    if trabajo.get("tipo") == "convertir":
+        sys.path.insert(0, str(AQUI))
+        import conversor
+
+        res_ruta = ruta.with_name(ruta.stem + "_resultado.json")
+        for resultados in conversor.correr(trabajo, progreso):
+            res_ruta.write_text(json.dumps({"items": resultados}, ensure_ascii=False, indent=1), encoding="utf-8")
+        return
     repo = Path(trabajo["repo"]).resolve()
     os.chdir(repo)  # el modelo abre sus archivos con rutas relativas a su carpeta
     sys.path.insert(0, str(repo))
@@ -204,5 +213,10 @@ def probar_fonemas():
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--fonemas":
         probar_fonemas()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--bajar-conversor":
+        sys.path.insert(0, str(AQUI))
+        import conversor
+
+        conversor.bajar_pesos()
     else:
         main()
