@@ -41,6 +41,15 @@ Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que fa
 
 No pongas la muestra de voz dentro de la carpeta de los videos: se doblaría como un audio más.
 
+## ✍️ Texto para tu voz
+Abajo de todo está el cuadro **Texto para tu voz**: escribí, pegá o cargá un texto (.txt, .docx, .md o .srt) y
+tocá **🗣️ Generar audio con mi voz**. Lo dice tu voz clonada (la muestra de voz de la carpeta elegida, en
+*3 · Voz → Muestra de voz propia*) y sale un mp3 en `salida/textos`, que también se escucha ahí mismo.
+- Lo dice frase por frase y escucha cada una con Whisper: si una no se entiende, la repite.
+- Una línea en blanco entre párrafos hace una pausa más larga.
+- El idioma del texto se detecta solo (o elegilo): castellano, inglés, alemán, ruso, francés, italiano o portugués.
+- Si cambiás algo y generás de nuevo, solo se rehacen las frases que cambiaron.
+
 ## 🎵 Canciones (opcional)
 Si un video o audio tiene partes cantadas, la app las detecta sola y las **vuelve a cantar en el idioma del
 doblaje, con la misma melodía y el timbre del cantante** (YingMusic-Singer-Plus). Lo hablado se dobla como siempre.
