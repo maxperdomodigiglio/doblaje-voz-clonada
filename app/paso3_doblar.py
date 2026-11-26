@@ -404,7 +404,7 @@ def generar_bloques(motor, w, bloques, cfg, ref_wav, ref_txt, avance=None):
             meta.update(hash=h, texto=texto)
             sf.write(str(wav_p), y, sr)
             escribir_json(meta_p, meta)
-            log(f"  bloque {b['id']:3d}/{len(bloques)}  {meta['dur']:5.1f}s  wer {meta['wer']:.2f}  {texto[:60]}")
+            log(f"  bloque {b.get('n', b['id']):3d}/{len(bloques)}  {meta['dur']:5.1f}s  wer {meta['wer']:.2f}  {texto[:60]}")
         if sr != SR:
             y = librosa.resample(y, orig_sr=sr, target_sr=SR).astype(np.float32)
         clips.append(y)

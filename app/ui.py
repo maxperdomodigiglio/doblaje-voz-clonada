@@ -3,9 +3,12 @@ con progreso por video, pausa y reanudacion."""
 import html
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -33,6 +36,8 @@ PASOS = {
     3: ("paso3_doblar.py", "Doblar", "voz clonada, mezcla y video final"),
 }
 PESO = {1: 0.3, 2: 0.2, 3: 0.5}
+IDIOMAS_TEXTO = {"🔎 Detectar solo": "auto", "Español": "es", "Inglés": "en", "Alemán": "de", "Ruso": "ru",
+                 "Francés": "fr", "Italiano": "it", "Portugués": "pt"}
 
 _proc = None
 _ocupado = threading.Lock()
@@ -48,7 +53,7 @@ def cargar_ajustes():
     except Exception:
         pass
     aj = {"carpeta": os.path.expandvars(base.get("carpeta_videos", "")), "idioma": OPC_IDIOMA[0], "voz": VOZ_VIDEO,
-          "contexto": "", "origen": ORIGEN_AUTO}
+          "contexto": "", "origen": ORIGEN_AUTO, "texto_idioma": "🔎 Detectar solo"}
     try:
         aj.update(json.loads(AJUSTES_UI.read_text(encoding="utf-8")))
     except Exception:
@@ -60,6 +65,8 @@ def cargar_ajustes():
         aj["voz"] = VOZ_MUESTRA if "muestra" in aj["voz"].lower() else VOZ_VIDEO
     if aj.get("origen") not in ORIGENES_UI:
         aj["origen"] = ORIGEN_AUTO
+    if aj.get("texto_idioma") not in IDIOMAS_TEXTO:
+        aj["texto_idioma"] = "🔎 Detectar solo"
     # lo propio de cada carpeta (de que trata y el idioma original) se guarda en <carpeta>/_proceso
     pc = ajustes_carpeta(aj["carpeta"])
     aj["contexto"] = pc.get("contexto", "")
@@ -422,6 +429,100 @@ def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=
         _ocupado.release()
 
 
+# ---------------------------------------------------------------- texto para tu voz
+def leer_texto_archivo(archivo):
+    """El texto de un .txt / .md / .srt / .docx cargado, para el cuadro de texto."""
+    if not archivo:
+        return gr.update()
+    p = Path(archivo)
+    try:
+        if p.suffix.lower() == ".docx":
+            import zipfile
+            xml = zipfile.ZipFile(p).read("word/document.xml").decode("utf-8")
+            pars = ["".join(re.findall(r"<w:t(?: [^>]*)?>(.*?)</w:t>", par, re.S))
+                    for par in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S)]
+            texto = "\n\n".join(html.unescape(x).strip() for x in pars if x.strip())
+        else:
+            crudo = p.read_bytes()
+            texto = None
+            for enc in ("utf-8-sig", "cp1252", "latin-1"):
+                try:
+                    texto = crudo.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if p.suffix.lower() == ".srt":  # solo lo que se dice, sin numeros ni tiempos
+                texto = " ".join(l.strip() for l in texto.splitlines()
+                                 if l.strip() and not l.strip().isdigit() and "-->" not in l)
+    except Exception as e:
+        raise gr.Error(f"No pude leer el archivo: {e}")
+    return gr.update(value=(texto or "").strip())
+
+
+def decir_texto(carpeta, voz, archivo_voz, texto, idioma_txt):
+    """Texto -> mp3 con la voz clonada de la muestra (decir.py, en un proceso aparte)."""
+    carpeta = (carpeta or "").strip().strip('"')
+    texto = (texto or "").strip()
+    if not texto:
+        raise gr.Error("Escribí, pegá o cargá el texto que querés que diga tu voz.")
+    if not carpeta or not Path(carpeta).is_dir():
+        raise gr.Error("Elegí primero una carpeta: ahí se guarda tu muestra de voz y el audio que sale.")
+    nueva = archivo_voz if (voz == VOZ_MUESTRA and archivo_voz) else None
+    if not nueva and not muestra_lista(carpeta):
+        raise gr.Error("Falta tu muestra de voz: en '3 · Voz' elegí '🎤 Una muestra de voz propia' y subí "
+                       "10-30 s de vos hablando.")
+    if not _ocupado.acquire(blocking=False):
+        raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine, o tocá Detener.")
+    salida = deque(maxlen=500)
+    try:
+        guardar_ajustes(carpeta=carpeta, texto_idioma=idioma_txt)
+        proc = Path(carpeta) / "_proceso"
+        tdir = proc / "textos"
+        tdir.mkdir(parents=True, exist_ok=True)
+        tx = tdir / "texto.txt"
+        tx.write_text(texto + "\n", encoding="utf-8")
+        cod = IDIOMAS_TEXTO.get(idioma_txt, "auto")
+        aj_path = tdir / "ajustes_texto.json"
+        aj_path.write_text(json.dumps({"carpeta_videos": carpeta, "idioma_codigo": cod if cod in IDIOMAS else "en",
+                                       "voz_muestra": str(proc / "voz_muestra"), "texto_archivo": str(tx),
+                                       "texto_idioma": cod}, ensure_ascii=False, indent=2), encoding="utf-8")
+        RUN["detener"] = False
+        for k in (("voz", "voz"), ("texto", "decir")):
+            RUN["prog"].pop(k, None)
+        pasos = [("voz_muestra.py", [f"--archivo={nueva}"], "Preparando tu muestra de voz", ("voz", "voz"))] \
+            if nueva else []
+        pasos.append(("decir.py", [], "Diciendo el texto con tu voz", ("texto", "decir")))
+        for script, extra, msg, clave in pasos:
+            if os.environ.get("DOBLAJE_SIMULAR"):
+                extra = extra + ["--simular"]  # solo para pruebas
+            salida.append("")
+            salida.append(f"=== {msg} ===")
+            hilo = _correr(script, [f"--config={aj_path}", *extra], salida)
+            while hilo.is_alive() or _proc.poll() is None:
+                pct, det = RUN["prog"].get(clave, (None, ""))
+                yield (f"⏳ {msg}…" + (f" {det} · {pct:.0f}%" if pct is not None else "")), _registro(salida), \
+                    gr.update()
+                time.sleep(1.0)
+            hilo.join(timeout=2)
+            if RUN["detener"]:
+                yield "⏹ Detenido.", _registro(salida), gr.update()
+                return
+            if _proc.returncode != 0:
+                yield ("❌ Terminó con errores: el detalle está en '🧾 Detalle técnico' y en _proceso/log.txt."), \
+                    _registro(salida), gr.update()
+                return
+        info = json.loads((tdir / "ultimo.json").read_text(encoding="utf-8"))
+        final = Path(info["archivo"])
+        copia = Path(tempfile.mkdtemp(prefix="texto_")) / final.name  # gradio solo sirve archivos de su carpeta
+        shutil.copyfile(final, copia)
+        flojas = info.get("flojas") or []
+        nota = (f" · {len(flojas)} frase(s) no salieron del todo claras: escuchalas; si alguna está mal, cambiale "
+                "algo y generá de nuevo (solo se rehacen las que cambian).") if flojas else ""
+        yield f"✅ Listo: **{final.name}** (en `salida/textos`){nota}", _registro(salida), gr.update(value=str(copia))
+    finally:
+        _ocupado.release()
+
+
 # ---------------------------------------------------------------- interfaz
 CSS = """
 .gradio-container {max-width: 1280px !important; margin: auto;}
@@ -471,6 +572,8 @@ footer {display: none !important;}
 #btn-stop {color: #dc2626 !important;}
 #pasos-sueltos {flex-wrap: nowrap !important;}
 #pasos-sueltos button {opacity: .85;}
+#tarjeta-texto {margin-top: 14px;}
+.nota-texto {font-size: 14px; opacity: .8; margin-top: -4px;}
 """
 
 
@@ -478,8 +581,8 @@ def armar():
     aj = cargar_ajustes()
     with gr.Blocks(title="Doblaje con voz clonada") as demo:
         gr.HTML('<div id="hero"><h1>🎙️ Doblaje con voz clonada</h1>'
-                '<p>Traducí y doblá tus videos o audios al inglés, alemán, ruso o castellano, con subtítulos. '
-                'Todo corre en tu compu, sin API key.</p></div>')
+                '<p>Traducí y doblá tus videos o audios al inglés, alemán, ruso o castellano, con subtítulos, '
+                'o hacé que tu voz diga cualquier texto. Todo corre en tu compu, sin API key.</p></div>')
         with gr.Row(equal_height=False):
             with gr.Column(scale=5, elem_classes="tarjeta"):
                 gr.HTML('<div class="seccion">1 · Carpeta con los videos o audios</div>')
@@ -530,6 +633,24 @@ def armar():
                 with gr.Accordion("🧾 Detalle técnico", open=False):
                     registro = gr.Textbox(show_label=False, lines=16, max_lines=16, autoscroll=True,
                                           interactive=False)
+        with gr.Column(elem_classes="tarjeta", elem_id="tarjeta-texto"):
+            gr.HTML('<div class="seccion">✍️ Texto para tu voz</div>')
+            gr.Markdown("Escribí, pegá o cargá un texto y lo dice **tu voz clonada** (la muestra de voz de la "
+                        "carpeta elegida, en '3 · Voz'). Sale un mp3 en `salida/textos`.", elem_classes="nota-texto")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=7):
+                    texto = gr.Textbox(show_label=False, lines=9, max_lines=30,
+                                       placeholder="Escribí acá lo que querés que diga tu voz. Dejá una línea en "
+                                                   "blanco entre párrafos para que haga una pausa más larga.")
+                with gr.Column(scale=3, min_width=250):
+                    archivo_txt = gr.File(label="O cargá un archivo (.txt, .docx, .md, .srt)",
+                                          file_types=[".txt", ".docx", ".md", ".srt"], type="filepath", height=90)
+                    idioma_txt = gr.Dropdown(list(IDIOMAS_TEXTO), value=aj["texto_idioma"],
+                                             label="Idioma en que está escrito")
+                    b_decir = gr.Button("🗣️ Generar audio con mi voz", variant="primary")
+                    b_decir_stop = gr.Button("⏹ Detener", variant="stop", size="sm")
+            estado_txt = gr.Markdown("")
+            audio_txt = gr.Audio(label="Resultado", type="filepath", interactive=False)
 
         def ver_voz(v, c):
             m = muestra_lista(c)
@@ -569,6 +690,9 @@ def armar():
         b_pausa.click(pausar_continuar, None, b_pausa, concurrency_limit=None, queue=False)
         b_stop.click(detener, None, b_pausa, concurrency_limit=None, queue=False)
         b_salida.click(abrir_salida, carpeta, None, queue=False)
+        archivo_txt.upload(leer_texto_archivo, archivo_txt, texto)
+        b_decir.click(decir_texto, [carpeta, voz, archivo_voz, texto, idioma_txt], [estado_txt, registro, audio_txt])
+        b_decir_stop.click(detener, None, b_pausa, concurrency_limit=None, queue=False)
     return demo
 
 
