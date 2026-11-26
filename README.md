@@ -3,7 +3,8 @@
 Traduce y dobla **videos o audios** al **inglés, alemán, ruso o castellano**, con la **voz clonada** del que habla
 (o con una muestra de voz que subas), conserva la música y el ambiente original, y agrega **subtítulos**.
 El idioma original se detecta solo (castellano, inglés, alemán, ruso, francés, italiano, portugués…).
-Todo corre en tu compu: **no necesita API key ni cuentas**.
+Todo corre en tu compu: **no necesita API key ni cuentas**. La interfaz se ve clara u oscura según cómo tengas
+configurado Windows (o el navegador).
 
 ## Qué necesitás
 - Windows con placa de video **NVIDIA** (ideal 12 GB de memoria de video o más).
@@ -20,7 +21,7 @@ de este repositorio y después tocá **Instalar** en la app. Tarda un rato.
 
 ## Uso
 1. Tocá **Iniciar** y después **Abrir interfaz**.
-2. **📁 Elegir…** la carpeta donde están los videos o audios (.mp4, .mov, .mkv, .mp3, .wav, .m4a…).
+2. **Elegir…** la carpeta donde están los videos o audios (.mp4, .mov, .mkv, .mp3, .wav, .m4a…).
 3. Elegí el idioma del doblaje (Inglés / Alemán / Ruso / Español) y la voz:
    - *Voz original de cada video*: clona la voz del que habla en cada video.
    - *Muestra de voz propia*: subí 10-30 s de una sola persona hablando, sin música.
@@ -32,7 +33,7 @@ Los subtítulos van en castellano cuando se puede (si el original es castellano,
 si no, en el idioma original. Si el audio ya está en el idioma elegido (por ejemplo castellano → castellano),
 no se traduce: solo se cambia la voz.
 
-En **⚙️ Opciones avanzadas** podés fijar el idioma original (si la detección automática se equivoca) y contar
+En **Opciones avanzadas** podés fijar el idioma original (si la detección automática se equivoca) y contar
 de qué trata el material (quién habla y sobre qué): ayuda a traducir mejor y queda guardado para esa carpeta.
 
 Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que falta.
@@ -43,7 +44,7 @@ No pongas la muestra de voz dentro de la carpeta de los videos: se doblaría com
 
 ## ✍️ Texto para tu voz
 Abajo de todo está el cuadro **Texto para tu voz**: escribí, pegá o cargá un texto (.txt, .docx, .md o .srt) y
-tocá **🗣️ Generar audio con mi voz**. Lo dice tu voz clonada (la muestra de voz de la carpeta elegida, en
+tocá **Generar audio con mi voz**. Lo dice tu voz clonada (la muestra de voz de la carpeta elegida, en
 *3 · Voz → Muestra de voz propia*) y sale un mp3 en `salida/textos`, que también se escucha ahí mismo.
 - Lo dice frase por frase y escucha cada una con Whisper: si una no se entiende, la repite.
 - Una línea en blanco entre párrafos hace una pausa más larga.
@@ -66,13 +67,13 @@ original y solo cambia quién canta:
 
 1. En Pinokio tocá **🎵 Instalar canto** (una sola vez, ~11 GB más con el conversor; el modelo de canto, ~3 GB, se
    baja la primera vez que canta). Si ya lo tenías instalado, aparece **🎵 Actualizar canto** para sumar el conversor.
-2. En la interfaz dejá tildado **🎵 Cantar las canciones** y tocá **▶ Hacer todo**.
+2. En la interfaz dejá tildado **Cantar las canciones** y tocá **▶ Hacer todo**.
 
 - La letra se traduce buscando la misma cantidad de sílabas por línea, para que entre en las notas.
 - Canta 3 versiones de cada trozo y se queda con la que mejor se entiende (la escucha con Whisper) y más afinada.
 - **Notas exactas:** el conversor lleva la voz nueva a la melodía del cantante original (con su vibrato), en la
   octava que le queda cómoda a la voz destino, y se le da sonido de voz cantada (presencia, compresión suave y un
-  poco de sala). Sin el conversor se afina con WORLD como antes (se puede apagar en ⚙️ Opciones avanzadas).
+  poco de sala). Sin el conversor se afina con WORLD como antes (se puede apagar en Opciones avanzadas).
 - Las partes cantadas van a velocidad normal (el video no se acelera ahí) y la música no se baja.
 - Si una canción ya está en el idioma del doblaje y la voz es la del video, queda la original.
 - El inglés es el que mejor canta; alemán, ruso y castellano salen con pronunciación aproximada (experimental).
@@ -88,4 +89,5 @@ Importante: cloná solo voces de personas que te hayan dado permiso.
 Demucs (Meta), Whisper (OpenAI), Qwen3-TTS y Qwen3 (Alibaba), YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; su VAE
 es de Stable Audio Open, Stability AI Community License), YingMusic-SVC (GiantAILab, código MIT; usa RMVPE,
 CAM++ de FunASR, BigVGAN v2 de NVIDIA y Whisper), detector de sonidos AST (MIT), espeak-ng, y las capas
-de descript-audio-codec (MIT) en `app/canto/dac_min`.
+de descript-audio-codec (MIT) en `app/canto/dac_min`. Letra de la interfaz: Lexend (SIL Open Font License,
+`app/fuentes/OFL.txt`).
