@@ -42,6 +42,18 @@ Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que fa
 
 No pongas la muestra de voz dentro de la carpeta de los videos: se doblaría como un audio más.
 
+## 🌐 Traductores
+En **Opciones avanzadas → Traductor** elegís quién traduce:
+- **Qwen3-4B** (el de siempre): rápido, ya viene instalado.
+- **Qwen3.5-9B**: más inteligente; corrige la transcripción, traduce y adapta las letras de las canciones.
+- **Hy-MT2-7B** (Tencent): un modelo hecho solo para traducir; lo hablado lo traduce él, y la corrección y las
+  letras las hace Qwen3-4B.
+
+Los dos nuevos se instalan una sola vez desde Pinokio con **Instalar traductores** (corren en su propio entorno,
+`env_traductor`, en 4 bits para que entren en la placa). La primera vez que usás cada uno baja su modelo
+(Hy-MT2-7B ~16 GB, Qwen3.5-9B ~19 GB). Al cambiar de traductor se rehacen solas las traducciones automáticas;
+las que revisaste a mano no se tocan. Para comparar, copiá el video doblado antes de cambiar de traductor.
+
 ## ✍️ Texto para tu voz
 Abajo de todo está el cuadro **Texto para tu voz**: escribí, pegá o cargá un texto (.txt, .docx, .md o .srt) y
 tocá **Generar audio con mi voz**. Lo dice tu voz clonada (la muestra de voz de la carpeta elegida, en
@@ -86,7 +98,7 @@ En `_proceso/capNN/revisar_XX.txt` queda una lista de lo dudoso de cada video, p
 Importante: cloná solo voces de personas que te hayan dado permiso.
 
 ## Créditos
-Demucs (Meta), Whisper (OpenAI), Qwen3-TTS y Qwen3 (Alibaba), YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; su VAE
+Demucs (Meta), Whisper (OpenAI), Qwen3-TTS, Qwen3 y Qwen3.5 (Alibaba), Hy-MT2 (Tencent, Apache 2.0), YingMusic-Singer-Plus (ASLP-lab, CC BY 4.0; su VAE
 es de Stable Audio Open, Stability AI Community License), YingMusic-SVC (GiantAILab, código MIT; usa RMVPE,
 CAM++ de FunASR, BigVGAN v2 de NVIDIA y Whisper), detector de sonidos AST (MIT), espeak-ng, y las capas
 de descript-audio-codec (MIT) en `app/canto/dac_min`. Letra de la interfaz: Lexend (SIL Open Font License,

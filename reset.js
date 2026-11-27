@@ -9,5 +9,10 @@ module.exports = {
     params: {
       path: "app/env_canto"
     }
+  }, {
+    method: "fs.rm",
+    params: {
+      path: "app/env_traductor"
+    }
   }]
 }

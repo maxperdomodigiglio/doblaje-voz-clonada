@@ -11,6 +11,7 @@ CLAUDE.md
 GEMINI.md
 QWEN.md
 app/env_canto/
+app/env_traductor/
 app/canto/YingMusic-Singer-Plus/
 app/canto/YingMusic-SVC/
 __pycache__/
