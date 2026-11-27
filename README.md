@@ -1,4 +1,4 @@
-# Doblaje automático con voz clonada (app de Pinokio)
+# Traductor de videos (app de Pinokio)
 
 Traduce y dobla **videos o audios** al **inglés, alemán, ruso o castellano**, con la **voz clonada** del que habla
 (o con una muestra de voz que subas), conserva la música y el ambiente original, y agrega **subtítulos**.
@@ -15,9 +15,9 @@ configurado Windows (o el navegador).
 **Desde GitHub (recomendado):** en Pinokio elegí descargar desde un link (*Download from URL*), pegá el link
 de este repositorio y después tocá **Instalar** en la app. Tarda un rato.
 
-**Desde un zip:** descomprimí la carpeta `doblaje-gregorio` dentro de la carpeta `api` de Pinokio
-(normalmente `C:\pinokio\api\doblaje-gregorio`), abrí Pinokio (o refrescá la página), entrá a la app
-**Doblaje Gregorio** y tocá **Instalar**.
+**Desde un zip:** descomprimí la carpeta `doblaje-voz-clonada` dentro de la carpeta `api` de Pinokio
+(normalmente `C:\pinokio\api\doblaje-voz-clonada`), abrí Pinokio (o refrescá la página), entrá a la app
+**Traductor de videos** y tocá **Instalar**.
 
 ## Uso
 1. Tocá **Iniciar** y después **Abrir interfaz**.
@@ -35,6 +35,8 @@ no se traduce: solo se cambia la voz.
 
 En **Opciones avanzadas** podés fijar el idioma original (si la detección automática se equivoca) y contar
 de qué trata el material (quién habla y sobre qué): ayuda a traducir mejor y queda guardado para esa carpeta.
+Para una serie con nombres difíciles podés dejar un `glosario.json` en `<carpeta>/_proceso/` (mismo formato que
+`app/glosario.json`): arreglos fijos de la transcripción, nombres propios y cómo pronunciar palabras.
 
 Mientras trabaja, cada video muestra su barra de avance y abajo el tiempo que falta.
 - **⏸ Pausar** frena todo y libera la placa de video y el procesador; **▶ Continuar** sigue en el mismo punto.
