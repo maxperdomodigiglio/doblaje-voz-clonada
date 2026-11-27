@@ -604,7 +604,7 @@ def _onda():
 
 
 CABECERA = (
-    '<header id="cabecera"><div class="cab-texto"><h1>Doblaje con voz clonada</h1>'
+    '<header id="cabecera"><div class="cab-texto"><h1>Traductor de videos</h1>'
     '<p>Traducí y doblá videos o audios al inglés, alemán, ruso o castellano con la voz de quien habla, '
     'o hacé que tu voz diga cualquier texto. Todo corre en tu compu, sin cuentas ni API key.</p></div>'
     + _onda() + '</header>')
@@ -775,7 +775,7 @@ def _titulo(texto, num=None):
 
 def armar():
     aj = cargar_ajustes()
-    with gr.Blocks(title="Doblaje con voz clonada") as demo:
+    with gr.Blocks(title="Traductor de videos") as demo:
         gr.HTML(CABECERA)
         with gr.Row(equal_height=False):
             with gr.Column(scale=5, elem_classes="tarjeta"):
@@ -804,8 +804,8 @@ def armar():
                                          label="Idioma en que hablan los videos o audios originales")
                     contexto = gr.Textbox(label="De qué trata (ayuda a traducir mejor: quién habla y de qué)",
                                           value=aj.get("contexto", ""), lines=2,
-                                          placeholder="Ej.: habla un psicólogo, en primera persona, sobre arte y "
-                                                      "salud mental. Se guarda para esta carpeta.")
+                                          placeholder="Ej.: una cocinera cuenta en primera persona las recetas de "
+                                                      "su pueblo. Se guarda para esta carpeta.")
                     afinar = gr.Checkbox(label="Afinar el canto con autotune (solo si falta el conversor de voz "
                                                "cantada)", value=bool(aj.get("afinar", True)), interactive=hay_canto)
                     traductor = gr.Dropdown(list(TRADUCTORES_UI), value=aj["traductor"], label="Traductor",

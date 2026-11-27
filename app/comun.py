@@ -1,4 +1,4 @@
-"""Utilidades compartidas del Doblaje Gregorio (Pinokio)."""
+"""Utilidades compartidas del Traductor de videos (Pinokio)."""
 import json
 import os
 import re

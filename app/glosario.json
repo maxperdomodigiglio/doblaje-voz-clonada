@@ -1,27 +1,11 @@
 {
-  "_nota": "Correcciones fijas que se aplican a la transcripcion en castellano antes del modelo, y pronunciaciones para la voz. Se pueden agregar lineas.",
-  "correcciones_es": [
-    ["\\bDuna\\w*(?:ich|icz)\\b", "Dunayevich"],
-    ["\\bKate (Moon|Richards)\\b", "Keith \\1"],
-    ["\\bSergio Marqu(?:i|is|y)\\b", "Sergio Marchi"],
-    ["\\bMarqu(?:i|is)\\b", "Marchi"],
-    ["\\bWhitehouse\\b", "Winehouse"],
-    ["\\bRowling\\b", "Rolling"],
-    ["\\bcalm down\\b", "come down"],
-    ["\\bAvi(?:ci|chi|cci)\\b", "Avicii"],
-    ["\\bglucogorticoides\\b", "glucocorticoides"],
-    ["\\bachich\\b", "hachís"]
-  ],
-  "nombres": [
-    "Gregorio Dunayevich", "Sergio Marchi", "Avicii", "Kurt Cobain", "Courtney Love", "Frances", "Jimi Hendrix",
-    "Janis Joplin", "Jim Morrison", "Brian Jones", "Keith Richards", "Mick Jagger", "Rolling Stones", "Beatles",
-    "Keith Moon", "The Who", "Amy Winehouse", "Whitney Houston", "Chris Cornell", "Basquiat", "Favaloro",
-    "Freud", "Eros", "Tánatos", "Narciso", "Eco", "Facundo Cabral", "Maradona", "Madonna", "Little Richard",
-    "Chuck Berry", "Luca Prodan", "Miguel Abuelo", "Paul McCartney", "Ringo"
-  ],
+  "_nota": "Glosario general, para todas las carpetas. Cada carpeta puede tener el suyo en <carpeta>/_proceso/glosario.json, con el mismo formato, y se suman. correcciones_es: arreglos fijos de la transcripcion en castellano [patron, reemplazo]; nombres: nombres propios que tienen que quedar bien escritos; pronunciacion: como tiene que decir la voz algunas palabras, por idioma.",
+  "correcciones_es": [],
+  "nombres": [],
   "pronunciacion": {
-    "en": {"Avicii": "Ah-VEE-chee"},
-    "de": {"Avicii": "Awitschi"},
-    "ru": {}
+    "en": {},
+    "de": {},
+    "ru": {},
+    "es": {}
   }
 }

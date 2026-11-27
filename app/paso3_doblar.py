@@ -219,21 +219,20 @@ def loudnorm(entrada, salida, lufs, tp=-1.5):
     return float(j["input_i"])
 
 
-ZOCALO = (200, 515, 1072, 651)  # zona del cartel "Doctor en Psicologia - Gregorio Dunayevich" (en 1280x720)
+ZOCALO = (200, 515, 1072, 651)  # zona del cartel con el nombre de quien habla (en 1280x720)
 
 
 def detectar_zocalos(video, d):
-    """Detecta cuando aparece el cartel con el nombre abajo, para subir los subtitulos en ese momento."""
+    """Detecta cuando aparece el cartel con el nombre abajo, para subir los subtitulos en ese momento.
+    Los carteles de cada serie son propios de su carpeta: <carpeta>/_proceso/zocalos.npy (si no esta, no se busca)."""
     import json
     import subprocess
     cache = d / "zocalos2.json"
     if cache.exists():
         return json.loads(cache.read_text(encoding="utf-8"))
-    tpl_p = APP_DIR / "zocalos.npy"  # carteles: nombre de Gregorio y "Comentarios y preguntas"
-    if not tpl_p.exists():
-        tpl_p = APP_DIR / "zocalo.npy"
-        if not tpl_p.exists():
-            return []
+    tpl_p = next((p for p in (d.parent / "zocalos.npy", d.parent / "zocalo.npy") if p.exists()), None)
+    if tpl_p is None:
+        return []
     tpls = np.load(str(tpl_p))
     if tpls.ndim == 2:
         tpls = tpls[None]
@@ -453,7 +452,7 @@ def frases_del_clip(clip, min_sil=0.14, min_frase=0.25):
 
 
 def distribuir(clip, voz_tramo, t0, cfg, limite=None):
-    """Reparte las frases del clip sobre los momentos en que Gregorio habla en el original
+    """Reparte las frases del clip sobre los momentos en que se habla en el original
     (mapeo proporcional de tiempo hablado), para no dejar silencios largos mientras mueve la boca.
     Devuelve [(tiempo_inicio, audio)]."""
     frases = frases_del_clip(clip)

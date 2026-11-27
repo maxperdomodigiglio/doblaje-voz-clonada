@@ -180,12 +180,22 @@ def _respuesta_simulada(usuario):
 
 
 # ---------------------------------------------------------------- glosario
-def cargar_glosario():
-    p = APP_DIR / "glosario.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def cargar_glosario(cfg=None):
+    """El glosario general (app/glosario.json) mas el de la carpeta (<carpeta>/_proceso/glosario.json), si hay."""
+    glos = {"correcciones_es": [], "nombres": [], "pronunciacion": {}}
+    rutas = [APP_DIR / "glosario.json"]
+    if cfg is not None:
+        rutas.append(carpeta_proceso(cfg) / "glosario.json")
+    for p in rutas:
+        try:
+            g = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        glos["correcciones_es"] += g.get("correcciones_es", [])
+        glos["nombres"] += [n for n in g.get("nombres", []) if n not in glos["nombres"]]
+        for cod, pal in g.get("pronunciacion", {}).items():
+            glos["pronunciacion"].setdefault(cod, {}).update(pal)
+    return glos
 
 
 def aplicar_glosario_es(texto, glos):
@@ -654,7 +664,7 @@ def main(cfg):
     modelos = " + ".join(filter(None, (t["traduce"], t["general"] if t["aparte"] else
                                        cfg.get("modelo_traduccion", QWEN4B))))
     log(f"Idioma: {cfg['idioma_nombre']} | traductor: {modelos}")
-    llm, glos = crear_llm(cfg), cargar_glosario()
+    llm, glos = crear_llm(cfg), cargar_glosario(cfg)
     errores = 0
     for d in caps:
         try:
