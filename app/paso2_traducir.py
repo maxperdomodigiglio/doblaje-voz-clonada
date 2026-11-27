@@ -10,10 +10,13 @@ Para cada capitulo preparado en el Paso 1:
 Nunca pisa una traduccion revisada a mano (las que no tienen "auto": true o tienen "curado": true).
 Con --forzar rehace las automaticas.
 """
+import atexit
 import difflib
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,8 +31,42 @@ VERSION_CORR = 1
 CONTEXTO = "Una persona habla a camara o en un audio, en primera persona."
 
 
+# ---------------------------------------------------------------- traductores
+# "general": corrige la transcripcion y adapta las letras de canciones; "traduce": si hay uno especialista,
+# traduce lo hablado. Los nuevos corren en su propio entorno (env_traductor), via traductor/servidor.py.
+QWEN4B = "Qwen/Qwen3-4B-Instruct-2507"
+TRADUCTOR_BASE = "qwen3-4b"
+TRADUCTORES = {
+    "qwen3-4b": {"general": QWEN4B, "traduce": None, "aparte": False},
+    "qwen3.5-9b": {"general": "Qwen/Qwen3.5-9B", "traduce": None, "aparte": True},
+    "hy-mt2-7b": {"general": QWEN4B, "traduce": "tencent/Hy-MT2-7B", "aparte": True},
+}
+
+
+def clave_traductor(cfg):
+    c = str(cfg.get("traductor") or TRADUCTOR_BASE).lower()
+    return c if c in TRADUCTORES else TRADUCTOR_BASE
+
+
+def python_traductor():
+    env = APP_DIR / "env_traductor"
+    for p in (env / "Scripts" / "python.exe", env / "bin" / "python"):
+        if p.exists():
+            return p
+    return None
+
+
+def crear_llm(cfg):
+    t = TRADUCTORES[clave_traductor(cfg)]
+    if not t["aparte"]:
+        return LLM(cfg)
+    return LLMAparte(cfg, t["general"], t["traduce"])
+
+
 # ---------------------------------------------------------------- modelo local
 class LLM:
+    especialista = False
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.tok = self.model = None
@@ -48,7 +85,7 @@ class LLM:
             nombre, cache_dir=cache, dtype=torch.bfloat16 if dev == "cuda" else torch.float32, device_map=dev)
         self.model.eval()
 
-    def chat(self, sistema, usuario, max_new_tokens=700, temperatura=0.0):
+    def chat(self, sistema, usuario, max_new_tokens=700, temperatura=0.0, semilla=None):
         if SIMULAR:
             return _respuesta_simulada(usuario)
         import torch
@@ -63,6 +100,74 @@ class LLM:
         with torch.no_grad():
             out = self.model.generate(ids, attention_mask=torch.ones_like(ids), **gen)
         return self.tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+class LLMAparte:
+    """Los traductores nuevos: un proceso aparte (env_traductor) que carga los modelos una sola vez."""
+
+    def __init__(self, cfg, general, traduce=None):
+        self.cfg, self.general, self.traduce = cfg, general, traduce
+        self.especialista = traduce is not None
+        self.p = None
+
+    def _arrancar(self):
+        py = python_traductor()
+        if py is None:
+            raise RuntimeError("Los traductores nuevos no están instalados: en Pinokio tocá 'Instalar traductores' "
+                               "(o elegí Qwen3-4B en Opciones avanzadas)")
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        self.p = subprocess.Popen([str(py), "-u", str(APP_DIR / "traductor" / "servidor.py")],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True,
+                                  encoding="utf-8", errors="replace", cwd=str(APP_DIR), env=env)
+        atexit.register(self.cerrar)
+
+    def _pedir(self, req):
+        if self.p is None or self.p.poll() is not None:
+            self._arrancar()
+        self.p.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        self.p.stdin.flush()
+        while True:
+            linea = self.p.stdout.readline()
+            if not linea:
+                raise RuntimeError("el traductor se cerró (el detalle está en el registro)")
+            linea = linea.strip()
+            if linea.startswith("{"):
+                break
+            if linea:
+                print(linea, file=sys.stderr, flush=True)  # algo que una libreria imprimio por su cuenta
+        r = json.loads(linea)
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error", "error del traductor"))
+        return r.get("texto", "")
+
+    def cerrar(self):
+        if self.p is not None and self.p.poll() is None:
+            try:
+                self.p.stdin.write('{"op": "fin"}\n')
+                self.p.stdin.flush()
+                self.p.wait(timeout=20)
+            except Exception:
+                self.p.kill()
+        self.p = None
+
+    def cargar(self):
+        if not SIMULAR:
+            for m in filter(None, (self.traduce, self.general)):
+                self._pedir({"op": "cargar", "modelo": m})
+
+    def chat(self, sistema, usuario, max_new_tokens=700, temperatura=0.0, semilla=None):
+        if SIMULAR:
+            return _respuesta_simulada(usuario)
+        return self._pedir({"op": "chat", "modelo": self.general, "max_new_tokens": max_new_tokens,
+                            "temperatura": temperatura, "semilla": semilla,
+                            "mensajes": [{"role": "system", "content": sistema}, {"role": "user", "content": usuario}]})
+
+    def traducir(self, pedido, max_new_tokens=400, semilla=None):
+        """Para el especialista: un solo pedido de usuario, con su formato."""
+        if SIMULAR:
+            return "[TRAD] " + pedido.rsplit("*[Source Text]*", 1)[-1].strip()
+        return self._pedir({"op": "chat", "modelo": self.traduce, "max_new_tokens": max_new_tokens,
+                            "semilla": semilla, "mensajes": [{"role": "user", "content": pedido}]})
 
 
 def _respuesta_simulada(usuario):
@@ -207,6 +312,32 @@ def _limpiar(tr, cfg):
     return " ".join(tr.split())
 
 
+def pedido_especialista(cfg, src, txt, previos, sig, ref_en=None):
+    """El formato que recomienda Hy-MT2: informacion de fondo + estilo + texto a traducir."""
+    L = cfg["idioma_destino"]
+    origen = ORIGENES.get(src, (src,))[0]
+    fondo = [f"About the video (written in Spanish): {cfg.get('contexto') or CONTEXTO}",
+             f"It is a voice-over dub from {origen}: the speaker talks in first person and the translation is read "
+             f"aloud over the same time slot, so it must be about as long as the original."]
+    if previos:
+        fondo.append("Previous fragments, already translated:\n"
+                     + "\n".join(f"{origen}: {b['es']}\n{L}: {b['tr']}" for b in previos))
+    if sig:
+        fondo.append(f"Next fragment (do not translate it): {sig}")
+    if ref_en:
+        fondo.append(f"Approved English translation of this same fragment: {ref_en}")
+    extra = {"ru": " Write people's and bands' names in Cyrillic; keep song and album titles as in the original.",
+             "de": " Address the viewers with 'Sie'.", "es": " Neutral Latin American Spanish."}.get(
+        cfg["idioma_codigo"], "")
+    estilo = (f"natural spoken {L}, first person, concise, may start or end mid-sentence like the original; names "
+              f"as usually written in {L}; numbers as digits.{extra}")
+    return ("*[Background Information]*\n" + "\n\n".join(fondo) + "\n\n"
+            f"Please translate the following text into {L}, taking the provided background information into "
+            f"consideration. Note that the translation style must strictly conform to [ **{estilo}** ]. "
+            "Only output the translated result without any additional explanation.\n"
+            f"*[Source Text]*\n{txt}")
+
+
 def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None, src="es"):
     """parcial: archivo donde se guarda cada bloque traducido, para retomar si se corta o se detiene."""
     sis = sistema_traduccion(cfg, src)
@@ -221,7 +352,8 @@ def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None, 
     for i, (s, e, txt) in enumerate(bloques):
         if avance:
             avance(i, len(bloques))
-        clave = hashlib.md5(f"{cfg['idioma_codigo']}|{txt}|{ref_en[i] if ref_en else ''}".encode()).hexdigest()[:16]
+        quien = "" if clave_traductor(cfg) == TRADUCTOR_BASE else clave_traductor(cfg) + "|"
+        clave = hashlib.md5(f"{quien}{cfg['idioma_codigo']}|{txt}|{ref_en[i] if ref_en else ''}".encode()).hexdigest()[:16]
         if clave in cache:
             hechos.append({"es": txt, "tr": cache[clave]})
             continue
@@ -236,7 +368,11 @@ def traducir_bloques(bloques, llm, cfg, ref_en=None, avance=None, parcial=None, 
         tr, problema = "", "vacia"
         for intento, temp in enumerate((0.0, 0.4)):
             try:
-                tr = _limpiar(llm.chat(sis, usuario, max_new_tokens=80 + len(txt), temperatura=temp), cfg)
+                if llm.especialista:
+                    pedido = pedido_especialista(cfg, src, txt, previos, sig, ref_en[i] if ref_en else None)
+                    tr = _limpiar(llm.traducir(pedido, max_new_tokens=80 + len(txt), semilla=1234 + 7 * intento), cfg)
+                else:
+                    tr = _limpiar(llm.chat(sis, usuario, max_new_tokens=80 + len(txt), temperatura=temp), cfg)
             except Exception:
                 log_error(f"traduccion del bloque {i + 1}")
                 tr = ""
@@ -309,10 +445,13 @@ def traducir_capitulo(d, cfg, llm, glos):
             log(f"[{d.name}] traduccion al {cfg['idioma_nombre']} ya revisada, no la toco")
             progreso(d.name, 2, 100, "traducción ya revisada")
             return
-        if not FORZAR:
+        if not FORZAR and prev.get("traductor", TRADUCTOR_BASE) == clave_traductor(cfg):
             log(f"[{d.name}] ya traducido al {cfg['idioma_nombre']} (automatico), salteo")
             progreso(d.name, 2, 100, "ya estaba traducido")
             return
+        if not FORZAR:
+            log(f"[{d.name}] cambió el traductor ({prev.get('traductor', TRADUCTOR_BASE)} -> "
+                f"{clave_traductor(cfg)}): rehago la traducción automática")
 
     progreso(d.name, 2, 1, "cargando el traductor")
     parcial = d / f"_parcial_{cfg['idioma_codigo']}.json"
@@ -368,8 +507,12 @@ def traducir_capitulo(d, cfg, llm, glos):
         if voz != tr:
             b["tts"] = voz
         salida.append(b)
+    t = TRADUCTORES[clave_traductor(cfg)]
     escribir_json(destino, {"slug": d.name, "video": es["video"], "idioma": cod, "origen": src, "auto": True,
-                            "modelo": cfg.get("modelo_traduccion", "Qwen/Qwen3-4B-Instruct-2507"), "bloques": salida})
+                            "traductor": clave_traductor(cfg),
+                            "modelo": t["traduce"] or (cfg.get("modelo_traduccion", QWEN4B) if not t["aparte"]
+                                                       else t["general"]),
+                            "bloques": salida})
     escribir_revision(d, cfg, es, corr, avisos)
     parcial.unlink(missing_ok=True)
     progreso(d.name, 2, 100, "listo")
@@ -464,7 +607,8 @@ def traducir_canto(d, cfg, llm):
     det = leer_json(p)
     cod = cfg["idioma_codigo"]
     destino = d / f"canto_{cod}.json"
-    h = huella(det.get("tramos", []), bool(cfg.get("voz_muestra")))
+    quien = [] if clave_traductor(cfg) == TRADUCTOR_BASE else [clave_traductor(cfg)]
+    h = huella(det.get("tramos", []), bool(cfg.get("voz_muestra")), *quien)
     if destino.exists():
         prev = leer_json(destino)
         if not prev.get("auto") or prev.get("curado"):
@@ -506,8 +650,11 @@ def main(cfg):
     if not caps:
         log("No hay capitulos preparados (falta el Paso 1).")
         return
-    log(f"Idioma: {cfg['idioma_nombre']} | modelo: {cfg.get('modelo_traduccion', 'Qwen/Qwen3-4B-Instruct-2507')}")
-    llm, glos = LLM(cfg), cargar_glosario()
+    t = TRADUCTORES[clave_traductor(cfg)]
+    modelos = " + ".join(filter(None, (t["traduce"], t["general"] if t["aparte"] else
+                                       cfg.get("modelo_traduccion", QWEN4B))))
+    log(f"Idioma: {cfg['idioma_nombre']} | traductor: {modelos}")
+    llm, glos = crear_llm(cfg), cargar_glosario()
     errores = 0
     for d in caps:
         try:
@@ -516,6 +663,8 @@ def main(cfg):
         except Exception:
             errores += 1
             log_error(d.name)
+    if isinstance(llm, LLMAparte):
+        llm.cerrar()
     log(f"Paso 2 terminado. Errores: {errores}")
     if errores:
         sys.exit(1)

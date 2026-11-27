@@ -37,6 +37,10 @@ PASOS = {
     3: ("paso3_doblar.py", "Doblar", "voz clonada, mezcla y video final"),
 }
 PESO = {1: 0.3, 2: 0.2, 3: 0.5}
+TRADUCTORES_UI = {"Qwen3-4B: rápido, el de siempre": "qwen3-4b",
+                  "Qwen3.5-9B: más inteligente (corrige, traduce y adapta letras)": "qwen3.5-9b",
+                  "Hy-MT2-7B: especialista en traducir": "hy-mt2-7b"}
+TRADUCTOR_BASE = "Qwen3-4B: rápido, el de siempre"
 IDIOMAS_TEXTO = {"Detectar solo": "auto", "Español": "es", "Inglés": "en", "Alemán": "de", "Ruso": "ru",
                  "Francés": "fr", "Italiano": "it", "Portugués": "pt"}
 
@@ -54,7 +58,7 @@ def cargar_ajustes():
     except Exception:
         pass
     aj = {"carpeta": os.path.expandvars(base.get("carpeta_videos", "")), "idioma": OPC_IDIOMA[0], "voz": VOZ_VIDEO,
-          "contexto": "", "origen": ORIGEN_AUTO, "texto_idioma": "Detectar solo"}
+          "contexto": "", "origen": ORIGEN_AUTO, "texto_idioma": "Detectar solo", "traductor": TRADUCTOR_BASE}
     try:
         aj.update(json.loads(AJUSTES_UI.read_text(encoding="utf-8")))
     except Exception:
@@ -68,6 +72,8 @@ def cargar_ajustes():
         aj["origen"] = ORIGEN_AUTO
     if aj.get("texto_idioma") not in IDIOMAS_TEXTO:
         aj["texto_idioma"] = "Detectar solo"
+    if aj.get("traductor") not in TRADUCTORES_UI:
+        aj["traductor"] = TRADUCTOR_BASE
     # lo propio de cada carpeta (de que trata y el idioma original) se guarda en <carpeta>/_proceso
     pc = ajustes_carpeta(aj["carpeta"])
     aj["contexto"] = pc.get("contexto", "")
@@ -356,8 +362,13 @@ def _registro(salida):
     return "\n".join(l.lstrip("~") for l in salida)
 
 
+def traductores_instalados():
+    env = APP_DIR / "env_traductor"
+    return (env / "Scripts" / "python.exe").exists() or (env / "bin" / "python").exists()
+
+
 def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=ORIGEN_AUTO, cantar=False,
-             afinar=True):
+             afinar=True, traductor=TRADUCTOR_BASE):
     carpeta = (carpeta or "").strip().strip('"')
     if not carpeta or not Path(carpeta).is_dir():
         raise gr.Error("Elegí primero la carpeta donde están los videos o audios.")
@@ -367,17 +378,21 @@ def ejecutar(pasos, carpeta, idioma, voz, archivo_voz, contexto, forzar, origen=
     lista = list(pasos)
     if voz == VOZ_MUESTRA and 3 in lista and not archivo_voz and not muestra_lista(carpeta):
         raise gr.Error("Elegiste usar una muestra de voz propia: subí un audio o video con la voz (10-30 s).")
+    clave_tr = TRADUCTORES_UI.get(traductor, "qwen3-4b")
+    if 2 in lista and clave_tr != "qwen3-4b" and not traductores_instalados():
+        raise gr.Error(f"Para usar {traductor.split(':')[0]}, en Pinokio tocá 'Instalar traductores' (una sola vez), "
+                       "o elegí Qwen3-4B en Opciones avanzadas.")
     if not _ocupado.acquire(blocking=False):
         raise gr.Error("Ya hay un proceso corriendo. Esperá a que termine, o tocá Detener.")
     salida = deque(maxlen=500)
     try:
         guardar_ajustes(carpeta=carpeta, idioma=idioma, voz=voz, origen=origen, cantar=bool(cantar),
-                        afinar=bool(afinar))
+                        afinar=bool(afinar), traductor=traductor)
         proc = Path(carpeta) / "_proceso"
         proc.mkdir(parents=True, exist_ok=True)
         ajustes = {"carpeta_videos": carpeta, "idioma_codigo": cod,
                    "idioma_origen": ORIGENES_UI.get(origen, "auto"), "cantar": bool(cantar and motor_instalado()),
-                   "canto_afinar": bool(afinar)}
+                   "canto_afinar": bool(afinar), "traductor": clave_tr}
         if (contexto or "").strip():
             ajustes["contexto"] = contexto.strip()
         if voz == VOZ_MUESTRA and 3 in lista:
@@ -793,6 +808,10 @@ def armar():
                                                       "salud mental. Se guarda para esta carpeta.")
                     afinar = gr.Checkbox(label="Afinar el canto con autotune (solo si falta el conversor de voz "
                                                "cantada)", value=bool(aj.get("afinar", True)), interactive=hay_canto)
+                    traductor = gr.Dropdown(list(TRADUCTORES_UI), value=aj["traductor"], label="Traductor",
+                                            info="Los dos nuevos se instalan una vez desde Pinokio ('Instalar "
+                                                 "traductores'). Al cambiar de traductor se rehacen las traducciones "
+                                                 "automáticas; las revisadas no se tocan.")
                     forzar = gr.Checkbox(label="Rehacer las traducciones automáticas (las revisadas no se tocan)",
                                          value=False)
                 b_todo = gr.Button("▶  Hacer todo", variant="primary", elem_id="btn-todo")
@@ -861,12 +880,13 @@ def armar():
         demo.load(ver_voz, [voz, carpeta], [archivo_voz, info_voz])
 
         def hacer(pasos):
-            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_, afinar_):
+            def correr_pasos(carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_, afinar_,
+                             traductor_):
                 yield from ejecutar(pasos, carpeta_, idioma_, voz_, archivo_, contexto_, forzar_, origen_, cantar_,
-                                    afinar_)
+                                    afinar_, traductor_)
             return correr_pasos
 
-        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen, cantar, afinar]
+        entradas = [carpeta, idioma, voz, archivo_voz, contexto, forzar, origen, cantar, afinar, traductor]
         for boton, pasos in ((b_todo, (1, 2, 3)), (b1, (1,)), (b2, (2,)), (b3, (3,))):
             boton.click(hacer(pasos), entradas, [tablero, registro, b_pausa])
         b_pausa.click(pausar_continuar, None, b_pausa, concurrency_limit=None, queue=False)
